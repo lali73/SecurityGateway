@@ -1,36 +1,5 @@
-🛡️ AI Security Gateway: Maintenance & Operations GuideThis document outlines how to restart and maintain the Hybrid-Cloud Security Gateway after a system shutdown or reboot.🚀 1. Quick Start Protocol (The 3-Terminal Rule)To bring the system online, you must open three separate terminal tabs in Kali Linux and run the following commands in order:
-
-Terminal 1: The AI Detection EngineThis is the "Brain" that sniffs traffic and detects attacks.Bashcd ~/Desktop/SecurityGateway_v1
-sudo python3 gateway_main.py
-
-Terminal 2: The API BridgeThis allows the Frontend/Dashboard to talk to your local machine.Bashcd ~/Desktop/SecurityGateway_v1
-python3 api_bridge.py
-
-
-Terminal 3: The Cloud TunnelThis creates the public link so your teammates can reach your machine.Bashcloudflared tunnel --url http://localhost:8000
-
-
-⚠️ Note: Every time you restart the tunnel, Cloudflare may generate a new URL. You must send this new URL to your teammates so they can update their Dashboard settings.
-
-🧹 2. System Reset (If Network is Blocked)If you were testing an attack and your Windows host can no longer ping the gateway, run the reset script to flush the firewall rules:Bashcd ~/Desktop/SecurityGateway_v1
-python3 reset_gateway.py
-
-
-📂 3. Project Architecturegateway_main.py: Core logic. Uses Scapy to sniff wg0 and AI to classify traffic.
-
-api_bridge.py: Flask server that receives "Manual Block" commands from the web.
-
-core/firewall_manager.py: Handles iptables commands to drop malicious IPs.
-
-core/db_bridge.py: Manages the connection to MongoDB Atlas for remote logging.
-
-.env: Contains sensitive credentials (MONGO_URI). Do not upload to GitHub.
-
-
-🛠️ 4. TroubleshootingIssueSolution"
-       Issue,                                          Solution
-"Address already in use",     A previous script is still running. Run fuser -k 8000/tcp to kill it.
-Tunnel link won't open,       Ensure api_bridge.py is running on port 8000.
-No traffic detected,          Ensure the Windows host is connected to the WireGuard VPN.
-MongoDB Auth Error,           Check your internet connection or verify the URI in the 
-                                  .env file.    
+🛡️ Cloud AI Security Gateway: Ops Guide (v2.0)This document outlines how to manage the Production Environment hosted on Google Cloud Platform.🚀 1. Starting the SystemSince we are in the cloud, we no longer need Cloudflare or local tunnels. The VM is the "Public Link."Step A: The VPN (The Body)Before the AI can see anything, the network tunnel must be active.Bashsudo wg-quick up wg0
+Verification: Run sudo wg show to confirm your phone is "Handshaking."Step B: The AI Detection Engine (The Brain)Run the main script using the environment-preserve flag to ensure MongoDB and AI models load correctly.Bashsudo -E python3 gateway_main.py
+Verification: Look for the 🕵️ Listening on wg0... message.Step C: The Dashboard API (The Bridge)If your web dashboard needs to send "Manual Block" commands to the VM:Bashpython3 api_bridge.py
+Note: Ensure your GCP Firewall allows traffic on the port your API uses (usually 8000 or 5000).🧹 2. System Recovery (Emergency Unblock)If the AI accidentally blocks your phone or your admin IP during a demo, run this to clear all firewall restrictions:Bashsudo iptables -F
+Pro-Tip: If you lose SSH access, use the "Serial Console" in the Google Cloud Web UI to run this command.📂 3. Cloud Project Architecturegateway_main.py: The core sniffer. Monitors wg0 (WireGuard) instead of eth0.core/ai_engine.py: Now uses Dynamic Paths to locate models on the Linux filesystem.core/feature_extractor.py: Calculates 6 network features from raw Layer 3 (VPN) packets.core/db_bridge.py: Authenticates to MongoDB Atlas via environment variables..env: Stores your MONGO_URI. Stored locally on VM only. (Verified ignored by Git).🛠️ 4. Cloud TroubleshootingIssueSolution"Interface 'wg0' not found"Run sudo wg-quick up wg0 before starting the Python script."Permission Denied (Socket)"You must use sudo -E to run the gateway script."Connected but no Internet"1. Check ens4 in wg0.conf. 2. Run sudo sysctl -w net.ipv4.ip_forward=1."No Handshake on Phone"Ensure the GCP Firewall has an Ingress Rule for UDP 51820."GitHub Push Failed"Use a Personal Access Token as the password, not your GitHub password.📝 5. Deployment Commands (Cheat Sheet)Check Logs: tail -f gateway.log (if you implement logging to file).Check Network Stats: ip addr show wg0.Update Code: git pull origin main (to bring changes from your laptop to the VM).Save Work: git push origin main (to save VM changes to GitHub).
