@@ -15,7 +15,7 @@ brain = AIAnalyzer()
 extractor = FeatureExtractor()
 
 # Safety Whitelist (Don't block the gateway or yourself)
-WHITELIST = ["10.0.0.1", "127.0.0.1"]
+WHITELIST = ["10.0.0.1", "127.0.0.1","10.0.0.3", "10.0.0.6"]
 
 def process_packet(packet):
     if packet.haslayer(IP):
