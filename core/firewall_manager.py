@@ -1,17 +1,29 @@
 import os
 
 def block_ip(ip_address):
-    """Adds iptables rules to both INPUT and FORWARD chains."""
-    # -I inserts at the top (Index 1) to ensure it overrides other rules
-    cmd_input = f"sudo iptables -I INPUT -s {ip_address} -j DROP"
-    cmd_forward = f"sudo iptables -I FORWARD -s {ip_address} -j DROP"
+    """
+    Blocks an IP using iptables on Linux.
+    """
+    print(f"🛡️  [KERNEL] Executing Block Rule for {ip_address}...")
     
-    os.system(cmd_input)
-    os.system(cmd_forward)
+    # Block on both INPUT (to this machine) and FORWARD (through this gateway)
+    cmd_input = f"sudo iptables -A INPUT -s {ip_address} -j DROP"
+    cmd_forward = f"sudo iptables -A FORWARD -s {ip_address} -j DROP"
     
-    print(f"🛡️  [FIREWALL] Blocked {ip_address} on INPUT and FORWARD chains.")
+    try:
+        os.system(cmd_input)
+        os.system(cmd_forward)
+        print(f"✅ Firewall updated: Traffic from {ip_address} is now DROPPED.")
+    except Exception as e:
+        print(f"❌ Firewall Error: {e}")
 
-def unblock_all():
-    """Flushes all rules to reset the gateway state."""
-    os.system("sudo iptables -F")
-    print("🔓 [FIREWALL] All IPs unblocked. System Reset.")    
+def flush_rules():
+    """
+    Clears all iptables rules to ensure a clean state.
+    """
+    print("🧹 Cleaning and resetting firewall rules...")
+    try:
+        os.system("sudo iptables -F")
+        print("✅ Firewall flushed successfully.")
+    except Exception as e:
+        print(f"❌ Error flushing firewall: {e}")

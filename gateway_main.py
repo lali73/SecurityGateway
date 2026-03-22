@@ -1,97 +1,96 @@
 import sys
 import os
 import time
-from scapy.all import sniff, IP
+import pandas as pd
+from scapy.all import sniff, IP, conf, L3RawSocket
 from collections import Counter
 
-# Ensure Python can find your 'core' and 'dashboard' modules
+# --- PATH SETUP ---
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from core.ai_engine import AIAnalyzer
 from core.feature_extractor import FeatureExtractor
-from core.firewall_manager import block_ip  
-from dashboard_bridge import log_event
+from core.firewall_manager import block_ip, flush_rules
+from core.utils import get_google_ips, is_whitelisted
 
-# Initialize the Brain and the Translator
+# --- INITIALIZE GLOBALS ---
 brain = AIAnalyzer()
 extractor = FeatureExtractor()
+GOOGLE_WHITELIST = get_google_ips()
 
-# --- CONFIGURATION ---
-WHITELIST = ["10.0.0.1", "127.0.0.1", "10.0.0.3", "10.0.0.6", "10.0.0.7"]
-ATTACK_THRESHOLD = 5 
+# CONFIGURATION
+ATTACK_THRESHOLD = 3   
+blocked_ips = set()
 attack_counter = Counter()
-
-# Timers for logging control
-last_log_time = {}      # Tracks attacks per IP
-LOG_COOLDOWN = 30       # Don't spam DB for same IP attack
-last_heartbeat = 0      # Tracks the 5-second terminal update
-normal_packet_count = 0
+total_analyzed = 0
+last_heartbeat = time.time()
 
 def process_packet(packet):
-    global normal_packet_count, last_heartbeat
+    global total_analyzed, last_heartbeat
     
-    if packet.haslayer(IP):
+    if packet and packet.haslayer(IP):
         src_ip = packet[IP].src
-        dst_ip = packet[IP].dst
-        features = extractor.extract(packet)
         
-        current_time = time.time()
+        # 1. WHITELIST CHECK (Ignore Google Infrastructure)
+        if is_whitelisted(src_ip, GOOGLE_WHITELIST):
+            return 
+
+        # 2. FEATURE EXTRACTION
+        features = extractor.extract(packet)
 
         if features:
-            prediction = brain.predict(features)
+            total_analyzed += 1
             
-            # --- ATTACK DETECTED ---
-            if prediction == "ATTACK":
-                status = "Allowed"
-                
-                # Check cooldown to avoid spamming Atlas
-                should_report = (src_ip not in last_log_time) or (current_time - last_log_time[src_ip] > LOG_COOLDOWN)
+            try:
+                # 3. AI INFERENCE
+                feat_df = pd.DataFrame([features], columns=brain.feature_names)
+                probs = brain.model.predict_proba(feat_df)[0]
+                attack_prob = probs[1] 
 
-                if src_ip in WHITELIST:
-                    status = "Allowed (Whitelisted)"
-                else:
-                    attack_counter[src_ip] += 1
-                    if attack_counter[src_ip] >= ATTACK_THRESHOLD:
-                        status = "Blocked"
-                        block_ip(src_ip)
-                        attack_counter[src_ip] = 0 
-                    else:
-                        status = f"Suspected ({int(attack_counter[src_ip])}/{ATTACK_THRESHOLD})"
+                # 4. DETECTION LOGIC
+                # Trigger on High AI Probability OR extreme Packet-Per-Second (PPS)
+                if (attack_prob > 0.75) or (features[6] > 800):
+                    if src_ip not in blocked_ips:
+                        attack_counter[src_ip] += 1
+                        print(f"⚠️  [DETECTED] {src_ip} | AI Prob: {attack_prob:.2f} | PPS: {features[6]:.1f}")
 
-                if should_report:
-                    last_log_time[src_ip] = current_time
-                    # Log to Database
-                    info = {"src": src_ip, "dst": dst_ip, "size": len(packet)}
-                    log_event(info, status=status, label=prediction)
-                    # Print to Terminal
-                    print(f"🔴 [GATEWAY] ATTACK DETECTED | {src_ip} -> {dst_ip} | {status}")
+                        if attack_counter[src_ip] >= ATTACK_THRESHOLD:
+                            print(f"🔴 [BLOCKING] Confirmed Attack Source: {src_ip}")
+                            block_ip(src_ip)
+                            blocked_ips.add(src_ip)
+            except Exception:
+                pass
 
-            # --- NORMAL TRAFFIC ---
-            else:
-                normal_packet_count += 1
-                # Slowly decay the suspicion counter if traffic is now clean
-                if attack_counter[src_ip] > 0:
-                    attack_counter[src_ip] -= 0.1
-
-        # --- HEARTBEAT (Every 5 Seconds) ---
-        # This shows you the gateway is alive even if no attacks are happening
-        if current_time - last_heartbeat > 5:
-            print(f"🟢 [HEARTBEAT] Gateway Active | Packets Analyzed: {normal_packet_count} | Status: Normal")
-            last_heartbeat = current_time
+        # 5. HEARTBEAT (Status Update every 5s)
+        if time.time() - last_heartbeat > 5:
+            print(f"🟢 [GATEWAY ACTIVE] Analyzed: {total_analyzed} | Blocked IPs: {len(blocked_ips)}")
+            last_heartbeat = time.time()
 
 def main():
-    print("--- AI Security Gateway: BRAIN ONLINE ---")
-    print(f"🛡️  Admin Whitelist: {WHITELIST}")
-    print(f"🕵️  Listening on wg0... (Heartbeat every 5s)")
+    os.system('clear')
+    print("==========================================")
+    print("   AI SECURITY GATEWAY: CLOUD-READY V2    ")
+    print("==========================================")
     
-    # Reset firewall at start for clean demo
-    os.system("sudo iptables -F") 
-    os.system("sudo iptables -t nat -A POSTROUTING -o ens4 -j MASQUERADE")
+    if brain.model is None:
+        print("❌ FATAL: AI Model failed to load. Check /models/ folder.")
+        sys.exit(1)
+
+    # Use L3RawSocket for Cloud 'any' interface compatibility
+    conf.L3socket = L3RawSocket
     
+    print("🛡️  Resetting Firewall Rules...")
+    flush_rules()
+    
+    print(f"🚀 Monitoring Network... (Targeting Internal IP 10.128.0.2)")
+    print("💡 Tip: Attack from VM B using Internal IP for best results.")
+
     try:
-        sniff(iface="wg0", prn=process_packet, store=0)
+        # sniff(iface=None) targets the 'any' interface
+        sniff(iface=None, prn=process_packet, store=0)
     except KeyboardInterrupt:
-        print("\n[!] Gateway shutting down.")
+        print("\n[!] User Shutdown. Cleaning up...")
+        flush_rules()
         sys.exit(0)
 
 if __name__ == "__main__":

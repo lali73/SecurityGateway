@@ -12,7 +12,7 @@ class AIAnalyzer:
         # --- DYNAMIC PATH FIX ---
         # This looks for the 'models' folder in the same directory where the script is running
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.model_path = os.path.join(base_dir, "models", "custom_ids_model.pkl")
+        self.model_path = os.path.join(base_dir, "models", "rf_ids_model.pkl")
         self.list_path = os.path.join(base_dir, "models", "feature_list.pkl")
         
         self.model = None
