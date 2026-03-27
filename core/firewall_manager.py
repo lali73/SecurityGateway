@@ -13,36 +13,29 @@ INFRA_WHITELIST = [
     "127.0.0.1"          # Localhost
 ]
 
+# --- firewall_manager.py Changes ---
+
 def initialize_firewall():
-    """
-    Resets iptables and injects the Safety Net. 
-    This is called when the Gateway starts.
-    """
     print("🛡️  VectraFlow: Initializing Secure Gateway Layers...")
     try:
-        # 1. Clear all existing rules
         os.system("sudo iptables -F")
         os.system("sudo iptables -X")
+        # Fast Flush for nftables too
+        os.system("sudo nft flush table netdev filter 2>/dev/null") 
 
-        # 2. LAYER 1: SSH PROTECTION (Insert at the absolute top)
-        # Position 1: Always allow Port 22
+        # 1. SSH Protection
         os.system("sudo iptables -I INPUT 1 -p tcp --dport 22 -j ACCEPT")
         
-        # Position 2: Keep current SSH sessions alive
-        os.system("sudo iptables -I INPUT 2 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
-
-        # 3. LAYER 2: INFRASTRUCTURE WHITELIST
-        for i, ip in enumerate(INFRA_WHITELIST, start=3):
+        # 2. IMPORTANT: Only allow established for NON-ATTACK ports
+        # We remove the generic 'ESTABLISHED' rule to prevent flood "leakage"
+        
+        # 3. Infrastructure Whitelist
+        for i, ip in enumerate(INFRA_WHITELIST, start=2):
             os.system(f"sudo iptables -I INPUT {i} -s {ip} -j ACCEPT")
 
-        # 4. LAYER 3: WIREGUARD UDP PORT
-        # Ensure the VPN tunnel can actually establish
-        os.system("sudo iptables -A INPUT -p udp --dport 51820 -j ACCEPT")
-
-        print(f"✅ Safety Net Engaged. {len(INFRA_WHITELIST)} Infra IPs whitelisted.")
+        print(f"✅ Safety Net Engaged.")
     except Exception as e:
         print(f"❌ Initialization Error: {e}")
-
 def block_ip(ip_address, threat_type="DDoS Attack", confidence=0.0):
     """
     The AI Engine calls this to drop traffic from a specific IP.
