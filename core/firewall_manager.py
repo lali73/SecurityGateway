@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from datetime import datetime, timezone
 
 import requests
 
@@ -22,15 +23,23 @@ def load_env_file(env_path):
 
 ENV = load_env_file(Path(__file__).resolve().parent.parent / ".env")
 
+
+def env_value(key, default=None):
+    value = ENV.get(key)
+    if value is None or value == "":
+        value = os.getenv(key)
+    if value is None or value == "":
+        return default
+    return value
+
 # --- BACKEND CONFIGURATION ---
-BASE_URL = ENV.get("BACKEND_BASE_URL") or os.getenv("BACKEND_BASE_URL") or "https://ethics-hits-troubleshooting-sas.trycloudflare.com"
+BASE_URL = env_value("BACKEND_BASE_URL", "https://ethics-hits-troubleshooting-sas.trycloudflare.com")
 ALERT_ENDPOINT = f"{BASE_URL.rstrip('/')}/api/alerts"
-
-# Ensure this matches the secret configured in your Leapcell Environment Variables
-ALERT_SECRET = "BRADSafe_SECURE_2026_PROD"
-
-# The VPN IP assigned to the user you are testing with
-MY_VPN_IP = "10.0.0.12"
+ALERT_SECRET = env_value("ALERT_SECRET", "BRADSafe_SECURE_2026_PROD")
+MY_VPN_IP = env_value("PROTECTED_VPN_IP", "10.0.0.12")
+WIREGUARD_PUBLIC_KEY = env_value("WIREGUARD_PUBLIC_KEY")
+GATEWAY_PEER_REF = env_value("GATEWAY_PEER_REF")
+GATEWAY_ID = env_value("GATEWAY_ID", "gateway-dev-1")
 
 
 def format_backend_error(response):
@@ -43,6 +52,36 @@ def format_backend_error(response):
     return body[:140] + ("..." if len(body) > 140 else "")
 
 
+def build_identity_payload():
+    payload = {}
+
+    if MY_VPN_IP:
+        payload["victim_vpn_ip"] = MY_VPN_IP
+    if WIREGUARD_PUBLIC_KEY:
+        payload["wireguard_public_key"] = WIREGUARD_PUBLIC_KEY
+    if GATEWAY_PEER_REF:
+        payload["gateway_peer_ref"] = GATEWAY_PEER_REF
+
+    return payload
+
+
+def build_alert_payload(is_attack=False, attacker_ip=None):
+    payload = build_identity_payload()
+
+    if not payload:
+        raise ValueError(
+            "At least one protected identity must be configured: "
+            "PROTECTED_VPN_IP, WIREGUARD_PUBLIC_KEY, or GATEWAY_PEER_REF."
+        )
+
+    payload["gateway_id"] = GATEWAY_ID
+    payload["event_type"] = "attack_detected" if is_attack else "heartbeat"
+    payload["detected_at"] = datetime.now(timezone.utc).isoformat()
+    payload["attacker_ip"] = attacker_ip if is_attack else "CLEAN"
+
+    return payload
+
+
 def send_status_to_backend(is_attack=False, attacker_ip=None):
     """
     Coordinates with BRADSafe Backend Route 6.1.
@@ -52,20 +91,13 @@ def send_status_to_backend(is_attack=False, attacker_ip=None):
         "X-Alert-Secret": ALERT_SECRET,
     }
 
-    if is_attack:
-        payload = {
-            "victim_vpn_ip": MY_VPN_IP,
-            "attacker_ip": attacker_ip,
-        }
-        log_msg = f"[ALERT] BRADSafe mitigation sent for {attacker_ip}"
-    else:
-        payload = {
-            "victim_vpn_ip": MY_VPN_IP,
-            "attacker_ip": "CLEAN",
-        }
-        log_msg = "[HEARTBEAT] BRADSafe System status: Healthy"
-
     try:
+        payload = build_alert_payload(is_attack=is_attack, attacker_ip=attacker_ip)
+        if is_attack:
+            log_msg = f"[ALERT] BRADSafe mitigation sent for {attacker_ip} targeting {payload.get('victim_vpn_ip', 'configured profile')}"
+        else:
+            log_msg = f"[HEARTBEAT] BRADSafe system status: Healthy for {payload.get('victim_vpn_ip', 'configured profile')}"
+
         response = requests.post(ALERT_ENDPOINT, json=payload, headers=headers, timeout=1.5)
         if response.status_code in [200, 201]:
             print(f"[BACKEND] {log_msg}")
@@ -76,4 +108,13 @@ def send_status_to_backend(is_attack=False, attacker_ip=None):
 
 
 def initialize_firewall():
-    print(f"[BACKEND] BRADSafe API Client: Connected to {BASE_URL}")
+    identifiers = []
+    if MY_VPN_IP:
+        identifiers.append(f"vpn_ip={MY_VPN_IP}")
+    if WIREGUARD_PUBLIC_KEY:
+        identifiers.append("wireguard_public_key=configured")
+    if GATEWAY_PEER_REF:
+        identifiers.append(f"gateway_peer_ref={GATEWAY_PEER_REF}")
+
+    identity_summary = ", ".join(identifiers) if identifiers else "no protected identity configured"
+    print(f"[BACKEND] BRADSafe API Client: Connected to {BASE_URL} ({identity_summary})")
