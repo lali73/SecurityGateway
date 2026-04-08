@@ -1,8 +1,30 @@
+import os
+from pathlib import Path
+
 import requests
 
+
+def load_env_file(env_path):
+    values = {}
+
+    if not env_path.exists():
+        return values
+
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+
+    return values
+
+
+ENV = load_env_file(Path(__file__).resolve().parent.parent / ".env")
+
 # --- BACKEND CONFIGURATION ---
-BASE_URL = "https://ai-firewall-backend-dani-d3v8671-ooua5n91.leapcell.dev"
-ALERT_ENDPOINT = f"{BASE_URL}/api/alerts"
+BASE_URL = ENV.get("BACKEND_BASE_URL") or os.getenv("BACKEND_BASE_URL") or "https://ethics-hits-troubleshooting-sas.trycloudflare.com"
+ALERT_ENDPOINT = f"{BASE_URL.rstrip('/')}/api/alerts"
 
 # Ensure this matches the secret configured in your Leapcell Environment Variables
 ALERT_SECRET = "BRADSafe_SECURE_2026_PROD"

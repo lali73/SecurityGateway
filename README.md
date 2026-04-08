@@ -2,6 +2,8 @@
 
 This project is a lightweight traffic-protection gateway designed to run on a Google Cloud VM. It watches traffic on the VM network interface, detects high packet-rate attack behavior, blocks the configured attacker IP at the host firewall level, and reports health or attack events to an external backend dashboard.
 
+The backend is currently running locally and exposed to the VM through a temporary Cloudflare tunnel URL. Because that URL changes after backend restarts, the gateway reads the backend base URL from `.env` so it can be updated in one place.
+
 ## What the system does
 
 - Monitors live traffic volume on the VM interface defined in `gateway_main.py`.
@@ -15,7 +17,7 @@ This project is a lightweight traffic-protection gateway designed to run on a Go
 - `gateway_main.py`
   Main runtime loop. Reads interface packet counters, decides when traffic crosses the attack threshold, applies blocking, and resets runtime blocks on startup and shutdown.
 - `core/firewall_manager.py`
-  Sends heartbeat and attack notifications to the remote backend.
+  Sends heartbeat and attack notifications to the remote backend, using `BACKEND_BASE_URL` from `.env`.
 - `core/ai_engine.py`
   Loads the trained model and feature list from the `models/` directory.
 - `core/feature_extractor.py`
@@ -52,6 +54,8 @@ The external backend is expected to expose an API endpoint that accepts gateway 
 
 Current gateway behavior:
 
+- Base URL source: `.env` key `BACKEND_BASE_URL`
+- Current local-backend tunnel URL: `https://ethics-hits-troubleshooting-sas.trycloudflare.com`
 - Endpoint: `POST /api/alerts`
 - Header: `X-Alert-Secret`
 - JSON body during heartbeat:
@@ -79,6 +83,29 @@ The backend should:
 - record health and attack state for the dashboard
 - avoid returning large HTML error pages, because the gateway expects a machine-oriented API response
 
+## Updating the Cloudflare tunnel URL
+
+Because the backend is local right now, it is exposed with a temporary `trycloudflare.com` URL that changes whenever the backend tunnel restarts.
+
+To update the gateway after the backend gets a new tunnel URL:
+
+1. open `.env`
+2. replace the value of `BACKEND_BASE_URL` with the new Cloudflare URL
+3. save the file
+4. restart the gateway process
+
+Example:
+
+```env
+BACKEND_BASE_URL=https://new-random-name.trycloudflare.com
+```
+
+The gateway will then send alerts to:
+
+```text
+https://new-random-name.trycloudflare.com/api/alerts
+```
+
 ## Test-mode behavior
 
 This repo is currently configured for internal testing on cloud infrastructure.
@@ -96,6 +123,7 @@ This startup cleanup is intentional for demos and validation. In future producti
 - Ensure WireGuard is already up before starting the gateway.
 - Allow the needed VPN and backend egress traffic in Google Cloud firewall rules.
 - Keep the model files in `models/` and do not move the existing folder structure.
+- Whenever the local backend tunnel changes, update `BACKEND_BASE_URL` in `.env` before restarting the gateway.
 
 ## Startup expectation
 
