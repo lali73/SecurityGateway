@@ -2,11 +2,15 @@ import sys
 import time
 import subprocess
 from core import firewall_manager
+from config.vpn_config import VPN_INTERFACE
 
 # --- CONFIGURATION ---
 INTERFACE = "ens4"
+IDENTITY_INTERFACE = VPN_INTERFACE
 WHITELIST = ["127.0.0.1", "10.128.0.2"]
 TEST_ATTACKER_IP = "10.128.0.3"
+DISCOVERY_RETRY_SECONDS = 5
+DISCOVERY_TIMEOUT_SECONDS = 60
 blocked_ips = set()
 
 
@@ -27,6 +31,54 @@ def clear_runtime_blocks():
         run_quiet(["sudo", "ip", "route", "del", "blackhole", ip])
 
     blocked_ips.clear()
+
+
+def get_interface_ipv4(iface):
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "addr", "show", iface],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("inet "):
+            continue
+
+        cidr = line.split()[1]
+        return cidr.split("/", 1)[0]
+
+    return None
+
+
+def discover_gateway_identity():
+    deadline = time.time() + DISCOVERY_TIMEOUT_SECONDS
+
+    while time.time() < deadline:
+        discovered_ip = get_interface_ipv4(IDENTITY_INTERFACE)
+        if discovered_ip:
+            firewall_manager.set_discovered_vpn_ip(discovered_ip)
+            print(f"[IDENTITY] Discovered {IDENTITY_INTERFACE} IPv4: {discovered_ip}")
+            return discovered_ip
+
+        remaining = max(int(deadline - time.time()), 0)
+        print(
+            f"[IDENTITY] Waiting for IPv4 on {IDENTITY_INTERFACE}... "
+            f"retrying in {DISCOVERY_RETRY_SECONDS}s ({remaining}s left)"
+        )
+        time.sleep(DISCOVERY_RETRY_SECONDS)
+
+    raise RuntimeError(
+        f"Could not discover an IPv4 address on {IDENTITY_INTERFACE} "
+        f"within {DISCOVERY_TIMEOUT_SECONDS} seconds."
+    )
 
 
 def extreme_lockdown():
@@ -108,9 +160,13 @@ def monitor_logic():
 
 
 if __name__ == "__main__":
-    extreme_lockdown()
     try:
+        discover_gateway_identity()
+        extreme_lockdown()
         monitor_logic()
+    except RuntimeError as e:
+        print(f"[FATAL] {e}")
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\n[SHUTDOWN] BRADSafe: Restoring System...")
         clear_runtime_blocks()

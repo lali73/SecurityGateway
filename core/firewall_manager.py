@@ -36,7 +36,7 @@ def env_value(key, default=None):
 BASE_URL = env_value("BACKEND_BASE_URL", "https://ethics-hits-troubleshooting-sas.trycloudflare.com")
 ALERT_ENDPOINT = f"{BASE_URL.rstrip('/')}/api/alerts"
 ALERT_SECRET = env_value("ALERT_SECRET", "BRADSafe_SECURE_2026_PROD")
-MY_VPN_IP = env_value("PROTECTED_VPN_IP", "10.0.0.12")
+DISCOVERED_VPN_IP = None
 WIREGUARD_PUBLIC_KEY = env_value("WIREGUARD_PUBLIC_KEY")
 GATEWAY_PEER_REF = env_value("GATEWAY_PEER_REF")
 GATEWAY_ID = env_value("GATEWAY_ID", "gateway-dev-1")
@@ -52,11 +52,21 @@ def format_backend_error(response):
     return body[:140] + ("..." if len(body) > 140 else "")
 
 
+def set_discovered_vpn_ip(vpn_ip):
+    global DISCOVERED_VPN_IP
+    DISCOVERED_VPN_IP = vpn_ip
+
+
+def get_current_vpn_ip():
+    return DISCOVERED_VPN_IP
+
+
 def build_identity_payload():
     payload = {}
 
-    if MY_VPN_IP:
-        payload["victim_vpn_ip"] = MY_VPN_IP
+    current_vpn_ip = get_current_vpn_ip()
+    if current_vpn_ip:
+        payload["victim_vpn_ip"] = current_vpn_ip
     if WIREGUARD_PUBLIC_KEY:
         payload["wireguard_public_key"] = WIREGUARD_PUBLIC_KEY
     if GATEWAY_PEER_REF:
@@ -71,7 +81,7 @@ def build_alert_payload(is_attack=False, attacker_ip=None):
     if not payload:
         raise ValueError(
             "At least one protected identity must be configured: "
-            "PROTECTED_VPN_IP, WIREGUARD_PUBLIC_KEY, or GATEWAY_PEER_REF."
+            "discovered wg0 IPv4, WIREGUARD_PUBLIC_KEY, or GATEWAY_PEER_REF."
         )
 
     payload["gateway_id"] = GATEWAY_ID
@@ -109,8 +119,9 @@ def send_status_to_backend(is_attack=False, attacker_ip=None):
 
 def initialize_firewall():
     identifiers = []
-    if MY_VPN_IP:
-        identifiers.append(f"vpn_ip={MY_VPN_IP}")
+    current_vpn_ip = get_current_vpn_ip()
+    if current_vpn_ip:
+        identifiers.append(f"vpn_ip={current_vpn_ip}")
     if WIREGUARD_PUBLIC_KEY:
         identifiers.append("wireguard_public_key=configured")
     if GATEWAY_PEER_REF:
