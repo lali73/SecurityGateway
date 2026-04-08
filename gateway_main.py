@@ -4,22 +4,22 @@ import time
 import pickle
 import pandas as pd
 import subprocess
+from core import firewall_manager 
 
 # --- CONFIGURATION ---
-INTERFACE = "wg0" 
+INTERFACE = "ens4" 
 MODEL_PATH = "models/rf_ids_model.pkl"
 FEATURES_PATH = "models/feature_list.pkl" 
 WHITELIST = ["127.0.0.1", "10.128.0.2"]
 blocked_ips = set()
 
 def extreme_lockdown():
-    print("🛠️  Optimizing Network Driver for Zero-Leakage...")
-    # Disable offloading so the firewall is 100% accurate
+    print("🛠️  Optimizing BRADSafe Network Driver...")
     subprocess.run(["sudo", "ethtool", "-K", INTERFACE, "gro", "off"], stderr=subprocess.DEVNULL)
     subprocess.run(["sudo", "ethtool", "-K", INTERFACE, "lro", "off"], stderr=subprocess.DEVNULL)
-    # Prepare the raw table (The fastest point in the iptables stack)
     subprocess.run(["sudo", "iptables", "-t", "raw", "-F"], stderr=subprocess.DEVNULL)
-    print("✅ Driver Ready.")
+    firewall_manager.initialize_firewall()
+    print("✅ BRADSafe Gateway Ready. Monitoring incoming pulses...")
 
 def get_interface_stats(iface):
     try:
@@ -33,31 +33,28 @@ def get_interface_stats(iface):
 def xdp_blackhole(ip):
     if not ip or ip in WHITELIST or ip in blocked_ips: return
     
-    print(f"\n⚡ [NITRO] Dropping {ip} at Hardware Entry Point...")
+    print(f"\n⚡ [NITRO] BRADSafe Dropping {ip} at Hardware Entry...")
 
-    # 1. THE ULTIMATE DROP: RAW Table + NOTRACK
-    # This stops the kernel from even 'counting' the packet for connection tracking
+    # 1. Enforcement
     subprocess.run(["sudo", "iptables", "-t", "raw", "-I", "PREROUTING", "-s", ip, "-j", "NOTRACK"], stderr=subprocess.DEVNULL)
     subprocess.run(["sudo", "iptables", "-t", "raw", "-I", "PREROUTING", "-s", ip, "-j", "DROP"], stderr=subprocess.DEVNULL)
-
-    # 2. THE ROUTING BLACKHOLE
     subprocess.run(["sudo", "ip", "route", "add", "blackhole", ip], stderr=subprocess.DEVNULL)
     
-    # 3. BUFFER FLUSH
-    # We toggle the interface to 'forget' those 4,000 packets per second sitting in the queue
+    # 2. Notification to Leapcell Backend
+    firewall_manager.send_status_to_backend(is_attack=True, attacker_ip=ip)
+
+    # 3. Buffer Flush
     subprocess.run(["sudo", "ip", "link", "set", INTERFACE, "down"], check=True)
     subprocess.run(["sudo", "ip", "link", "set", INTERFACE, "up"], check=True)
 
     blocked_ips.add(ip)
-    print(f"🚫 [GATEWAY] {ip} is now invisible to this system.")
+    print(f"🚫 [GATEWAY] {ip} neutralized. BRADSafe Resuming Guard.")
 
 def monitor_logic():
-    global expected_features, model
     prev_pkts = get_interface_stats(INTERFACE)
     last_check = time.time()
+    last_heartbeat = time.time()
     
-    print(f"🛡️  VectraFlow: Active Shield on {INTERFACE}...")
-
     while True:
         time.sleep(1) 
         curr_pkts = get_interface_stats(INTERFACE)
@@ -67,23 +64,25 @@ def monitor_logic():
         duration = curr_time - last_check
         pps = delta_p / duration
         
-        # Threshold: If PPS is > 1000, it's an attack
+        # --- Heartbeat: Every 10 seconds ---
+        if curr_time - last_heartbeat > 10:
+            firewall_manager.send_status_to_backend(is_attack=False)
+            last_heartbeat = curr_time
+
+        # --- Attack Threshold ---
         if pps > 1000: 
             attacker_ip = "10.128.0.3" 
             if attacker_ip not in blocked_ips:
                 print(f"⚠️  [ATTACK DETECTED] Intensity: {int(pps)} PPS")
                 xdp_blackhole(attacker_ip)
-                # Reset baseline after interface toggle
-                time.sleep(1) # Wait for link to stabilize
+                time.sleep(1)
                 prev_pkts = get_interface_stats(INTERFACE)
                 continue
             else:
-                # If we are already blocking, this PPS is just background noise
-                # We will display it as 0 if it's below a 'leakage' threshold
                 display_pps = int(pps) if pps > 5000 else 0
-                sys.stdout.write(f"\r✨ [STATUS] PPS: {display_pps} | System Protected   ")
+                sys.stdout.write(f"\r✨ [STATUS] PPS: {display_pps} | BRADSafe Protected   ")
         else:
-            sys.stdout.write(f"\r✨ [STATUS] PPS: {int(pps)} | System Healthy     ")
+            sys.stdout.write(f"\r✨ [STATUS] PPS: {int(pps)} | BRADSafe Healthy     ")
         
         sys.stdout.flush()
         prev_pkts = curr_pkts
@@ -96,7 +95,7 @@ if __name__ == "__main__":
         with open(MODEL_PATH, 'rb') as f: model = pickle.load(f)
         monitor_logic()
     except KeyboardInterrupt:
-        print("\n🧹 Restoring System...")
+        print("\n🧹 BRADSafe: Restoring System...")
         for ip in blocked_ips:
             subprocess.run(["sudo", "ip", "route", "del", "blackhole", ip], stderr=subprocess.DEVNULL)
         subprocess.run(["sudo", "iptables", "-t", "raw", "-F"], stderr=subprocess.DEVNULL)
