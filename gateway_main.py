@@ -1,15 +1,10 @@
-import os
 import sys
 import time
-import pickle
-import pandas as pd
 import subprocess
 from core import firewall_manager 
 
 # --- CONFIGURATION ---
 INTERFACE = "ens4" 
-MODEL_PATH = "models/rf_ids_model.pkl"
-FEATURES_PATH = "models/feature_list.pkl" 
 WHITELIST = ["127.0.0.1", "10.128.0.2"]
 blocked_ips = set()
 
@@ -91,8 +86,6 @@ def monitor_logic():
 if __name__ == "__main__":
     extreme_lockdown()
     try:
-        with open(FEATURES_PATH, 'rb') as f: expected_features = pickle.load(f)
-        with open(MODEL_PATH, 'rb') as f: model = pickle.load(f)
         monitor_logic()
     except KeyboardInterrupt:
         print("\n🧹 BRADSafe: Restoring System...")

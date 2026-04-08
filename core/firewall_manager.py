@@ -1,6 +1,4 @@
 import requests
-import json
-import time
 
 # --- BACKEND CONFIGURATION ---
 BASE_URL = "https://ai-firewall-backend-dani-d3v8671-ooua5n91.leapcell.dev"
