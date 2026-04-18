@@ -1,25 +1,244 @@
 import sys
 import time
 import subprocess
+from collections import deque
+from datetime import datetime
+from threading import Event, Lock, Thread
 from core import firewall_manager
 from config.vpn_config import VPN_INTERFACE, VPN_SUBNET
 from core.ai_engine import AIAnalyzer
 from core.feature_extractor import FeatureExtractor
 from core.peer_traffic_monitor import PeerTrafficMonitor
+import psutil
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 # --- CONFIGURATION ---
 INTERFACE = "ens4"
 IDENTITY_INTERFACE = VPN_INTERFACE
 WHITELIST = ["127.0.0.1", "10.128.0.2"]
+REGISTERED_PEERS = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.5"]
 DISCOVERY_RETRY_SECONDS = 5
 DISCOVERY_TIMEOUT_SECONDS = 60
 HEARTBEAT_SECONDS = 10
 DETECTION_INTERVAL_SECONDS = 1
 MONITOR_WINDOW_SECONDS = 5
 AI_ATTACK_THRESHOLD = 0.80
+UNDER_ATTACK_HOLD_SECONDS = 8
+INCIDENT_HISTORY_SIZE = 10
 RAW_BLOCK_CHAIN = "BRADSAFE_RAW"
 FILTER_BLOCK_CHAIN = "BRADSAFE_FILTER"
 blocked_flows = set()
+
+
+def now_label():
+    return datetime.now().strftime("%H:%M:%S")
+
+
+class DashboardState:
+    def __init__(self, registered_peers):
+        self.lock = Lock()
+        self.registered_peers = []
+        self.stop_event = Event()
+        self.peer_rows = {}
+        self.events = deque(maxlen=INCIDENT_HISTORY_SIZE)
+        self.global_pps = 0.0
+        self.cpu_percent = 0.0
+        self.ram_percent = 0.0
+        self.ai_status = "Loading"
+        self.backend_status = "Initializing"
+        self.gateway_identity = "Resolving"
+        self.started_at = now_label()
+        for peer_ip in registered_peers:
+            self.ensure_peer(peer_ip)
+
+    def ensure_peer(self, peer_ip):
+        if peer_ip in self.peer_rows:
+            return
+
+        self.peer_rows[peer_ip] = {
+            "status": "Healthy",
+            "pps": 0.0,
+            "kbps": 0.0,
+            "score": 0.0,
+            "last_update": 0.0,
+            "last_attack": 0.0,
+            "attacker_ip": "-",
+        }
+        if peer_ip not in self.registered_peers:
+            self.registered_peers.append(peer_ip)
+            self.registered_peers.sort(key=lambda ip: tuple(int(part) for part in ip.split(".")))
+
+    def set_ai_status(self, status):
+        with self.lock:
+            self.ai_status = status
+
+    def set_backend_status(self, status):
+        with self.lock:
+            self.backend_status = status
+
+    def set_gateway_identity(self, identity):
+        with self.lock:
+            self.gateway_identity = identity
+
+    def set_system_stats(self, global_pps, cpu_percent, ram_percent):
+        with self.lock:
+            self.global_pps = global_pps
+            self.cpu_percent = cpu_percent
+            self.ram_percent = ram_percent
+
+    def mark_peer(self, peer_ip, status, pps, kbps, score, attacker_ip="-"):
+        with self.lock:
+            self.ensure_peer(peer_ip)
+            row = self.peer_rows[peer_ip]
+            current_time = time.time()
+            row["status"] = status
+            row["pps"] = pps
+            row["kbps"] = kbps
+            row["score"] = score
+            row["last_update"] = current_time
+            row["attacker_ip"] = attacker_ip
+            if status == "Under Attack":
+                row["last_attack"] = current_time
+
+    def cool_off_peers(self):
+        with self.lock:
+            current_time = time.time()
+            for row in self.peer_rows.values():
+                if current_time - row["last_update"] > HEARTBEAT_SECONDS:
+                    row["pps"] = 0.0
+                    row["kbps"] = 0.0
+                    row["score"] = 0.0
+                    row["attacker_ip"] = "-"
+                if current_time - row["last_attack"] > UNDER_ATTACK_HOLD_SECONDS:
+                    row["status"] = "Healthy"
+
+    def add_event(self, level, message, peer_ip=None, attacker_ip=None):
+        with self.lock:
+            self.events.appendleft(
+                {
+                    "time": now_label(),
+                    "level": level,
+                    "message": message,
+                    "peer_ip": peer_ip or "-",
+                    "attacker_ip": attacker_ip or "-",
+                }
+            )
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "registered_peers": list(self.registered_peers),
+                "peer_rows": {ip: row.copy() for ip, row in self.peer_rows.items()},
+                "events": list(self.events),
+                "global_pps": self.global_pps,
+                "cpu_percent": self.cpu_percent,
+                "ram_percent": self.ram_percent,
+                "ai_status": self.ai_status,
+                "backend_status": self.backend_status,
+                "gateway_identity": self.gateway_identity,
+                "started_at": self.started_at,
+            }
+
+
+def status_text(status, pulse_on):
+    if status == "Under Attack":
+        style = "bold white on red" if pulse_on else "bold red"
+        return Text("UNDER ATTACK", style=style)
+    return Text("HEALTHY", style="bold green")
+
+
+def build_header_panel(snapshot):
+    grid = Table.grid(expand=True)
+    grid.add_column(justify="left", ratio=2)
+    grid.add_column(justify="center", ratio=1)
+    grid.add_column(justify="center", ratio=1)
+    grid.add_column(justify="center", ratio=1)
+    grid.add_column(justify="right", ratio=2)
+    grid.add_row(
+        f"[bold cyan]Gateway[/] {snapshot['gateway_identity']}",
+        f"[bold white]Global PPS[/] {snapshot['global_pps']:.0f}",
+        f"[bold white]CPU[/] {snapshot['cpu_percent']:.1f}%",
+        f"[bold white]RAM[/] {snapshot['ram_percent']:.1f}%",
+        f"[bold white]AI[/] {snapshot['ai_status']}",
+    )
+    grid.add_row(
+        f"[bold white]Backend[/] {snapshot['backend_status']}",
+        "",
+        "",
+        "",
+        f"[dim]Started {snapshot['started_at']}[/dim]",
+    )
+    return Panel(grid, title="[bold bright_cyan]BRADSafe SOC Dashboard[/]", border_style="bright_cyan")
+
+
+def build_peer_table(snapshot):
+    pulse_on = int(time.time()) % 2 == 0
+    table = Table(expand=True, header_style="bold bright_cyan")
+    table.add_column("Peer IP", style="cyan", no_wrap=True)
+    table.add_column("Status", justify="center")
+    table.add_column("Current PPS", justify="right")
+    table.add_column("Bandwidth (Kbps)", justify="right")
+    table.add_column("AI Probability", justify="right")
+
+    for peer_ip in snapshot["registered_peers"]:
+        row = snapshot["peer_rows"].get(peer_ip, {})
+        table.add_row(
+            peer_ip,
+            status_text(row.get("status", "Healthy"), pulse_on),
+            f"{row.get('pps', 0.0):,.0f}",
+            f"{row.get('kbps', 0.0):,.1f}",
+            f"{row.get('score', 0.0):.3f}",
+        )
+
+    return Panel(table, title="[bold white]Protected Peers[/]", border_style="green")
+
+
+def build_events_panel(snapshot):
+    events_table = Table(expand=True, header_style="bold bright_white")
+    events_table.add_column("Time", style="dim", width=10)
+    events_table.add_column("Level", width=10)
+    events_table.add_column("Victim IP", style="cyan", width=14)
+    events_table.add_column("Attacker IP", style="magenta", width=14)
+    events_table.add_column("Event", ratio=1)
+
+    if not snapshot["events"]:
+        events_table.add_row("-", "-", "-", "-", "[dim]No incidents recorded[/dim]")
+    else:
+        for event in snapshot["events"]:
+            level_style = "bold white on red" if event["level"] == "ALERT" else "bold yellow"
+            message_style = "bold red" if event["level"] == "ALERT" else "white"
+            events_table.add_row(
+                event["time"],
+                Text(event["level"], style=level_style),
+                event["peer_ip"],
+                event["attacker_ip"],
+                Text(event["message"], style=message_style),
+            )
+
+    return Panel(events_table, title="[bold red]Security Events[/]", border_style="red")
+
+
+def build_dashboard(snapshot):
+    layout = Layout()
+    layout.split_column(
+        Layout(build_header_panel(snapshot), size=5),
+        Layout(name="body", ratio=1),
+        Layout(build_events_panel(snapshot), size=14),
+    )
+    layout["body"].update(build_peer_table(snapshot))
+    return layout
+
+
+def dashboard_worker(state):
+    with Live(build_dashboard(state.snapshot()), refresh_per_second=4, screen=True) as live:
+        while not state.stop_event.is_set():
+            state.cool_off_peers()
+            live.update(build_dashboard(state.snapshot()))
+            time.sleep(1)
 
 
 def run_quiet(command, check=False):
@@ -89,14 +308,8 @@ def discover_gateway_identity():
         discovered_ip = get_interface_ipv4(IDENTITY_INTERFACE)
         if discovered_ip:
             firewall_manager.set_discovered_vpn_ip(discovered_ip)
-            print(f"[IDENTITY] Discovered {IDENTITY_INTERFACE} IPv4: {discovered_ip}")
             return discovered_ip
 
-        remaining = max(int(deadline - time.time()), 0)
-        print(
-            f"[IDENTITY] Waiting for IPv4 on {IDENTITY_INTERFACE}... "
-            f"retrying in {DISCOVERY_RETRY_SECONDS}s ({remaining}s left)"
-        )
         time.sleep(DISCOVERY_RETRY_SECONDS)
 
     raise RuntimeError(
@@ -106,27 +319,23 @@ def discover_gateway_identity():
 
 
 def extreme_lockdown():
-    print("[INIT] Optimizing BRADSafe Network Driver...")
     run_quiet(["sudo", "ethtool", "-K", INTERFACE, "gro", "off"])
     run_quiet(["sudo", "ethtool", "-K", INTERFACE, "lro", "off"])
     ensure_block_chains()
     clear_runtime_blocks()
-    firewall_manager.initialize_firewall()
-    print("[READY] BRADSafe Gateway Ready. Monitoring incoming pulses with a fresh blocklist...")
+    return firewall_manager.initialize_firewall()
 
-def protect_peer(attacker_ip, victim_ip, analysis, snapshot):
+def protect_peer(attacker_ip, victim_ip, analysis, snapshot, dashboard_state):
     flow_key = (attacker_ip, victim_ip)
     if not attacker_ip or not victim_ip or attacker_ip in WHITELIST or flow_key in blocked_flows:
         return
-
-    print(f"\n[BLOCK] BRADSafe Dropping {attacker_ip} traffic targeting {victim_ip}...")
 
     run_quiet(
         ["sudo", "iptables", "-t", "raw", "-A", RAW_BLOCK_CHAIN, "-s", attacker_ip, "-d", victim_ip, "-j", "DROP"]
     )
     run_quiet(["sudo", "iptables", "-A", FILTER_BLOCK_CHAIN, "-s", attacker_ip, "-d", victim_ip, "-j", "DROP"])
 
-    firewall_manager.send_status_to_backend(
+    backend_result = firewall_manager.send_status_to_backend(
         is_attack=True,
         attacker_ip=attacker_ip,
         victim_vpn_ip=victim_ip,
@@ -136,17 +345,38 @@ def protect_peer(attacker_ip, victim_ip, analysis, snapshot):
     )
 
     blocked_flows.add(flow_key)
-    print(
-        f"[LOCKED] {attacker_ip} -> {victim_ip} neutralized "
-        f"(type={analysis['attack_type']}, score={analysis['attack_probability']:.3f})."
+    dashboard_state.mark_peer(
+        victim_ip,
+        "Under Attack",
+        snapshot.pps,
+        (snapshot.bps * 8) / 1000,
+        analysis["attack_probability"],
+        attacker_ip=attacker_ip,
     )
+    dashboard_state.add_event(
+        "ALERT",
+        (
+            f"Victim {victim_ip} under {analysis['attack_type']} pressure. "
+            f"Neutralizing source {attacker_ip}."
+        ),
+        peer_ip=victim_ip,
+        attacker_ip=attacker_ip,
+    )
+    if backend_result["ok"]:
+        dashboard_state.set_backend_status("Connected")
+    else:
+        dashboard_state.set_backend_status("Degraded")
+        dashboard_state.add_event("WARN", backend_result["message"], peer_ip=victim_ip, attacker_ip=attacker_ip)
 
 
-def monitor_logic():
+def monitor_logic(dashboard_state):
     peer_monitor = PeerTrafficMonitor(INTERFACE, VPN_SUBNET, window_seconds=MONITOR_WINDOW_SECONDS)
     feature_extractor = FeatureExtractor()
     ai_analyzer = AIAnalyzer()
     last_heartbeat = time.time()
+    dashboard_state.set_ai_status("Active" if ai_analyzer.model is not None else "Load Error")
+    if ai_analyzer.load_error:
+        dashboard_state.add_event("WARN", ai_analyzer.load_error)
 
     peer_monitor.start()
 
@@ -156,60 +386,93 @@ def monitor_logic():
             curr_time = time.time()
             snapshots = peer_monitor.snapshots(now=curr_time)
 
-            if not snapshots:
-                sys.stdout.write("\r[STATUS] No active protected peers detected.     ")
-                sys.stdout.flush()
-                continue
+            for snapshot in snapshots:
+                dashboard_state.mark_peer(snapshot.victim_ip, "Healthy", 0.0, 0.0, 0.0)
 
-            peer_summaries = []
+            snapshot_by_peer = {snapshot.victim_ip: snapshot for snapshot in snapshots}
+            global_pps = sum(snapshot.pps for snapshot in snapshots)
+            dashboard_state.set_system_stats(
+                global_pps=global_pps,
+                cpu_percent=psutil.cpu_percent(interval=None),
+                ram_percent=psutil.virtual_memory().percent,
+            )
+
             send_heartbeat = curr_time - last_heartbeat >= HEARTBEAT_SECONDS
 
-            for snapshot in snapshots:
+            for peer_ip in dashboard_state.registered_peers:
+                snapshot = snapshot_by_peer.get(peer_ip)
+                if snapshot is None:
+                    dashboard_state.mark_peer(peer_ip, "Healthy", 0.0, 0.0, 0.0)
+                    continue
+
                 feature_vector = feature_extractor.build_peer_features(snapshot)
                 analysis = ai_analyzer.analyze(feature_vector)
-                peer_summaries.append(
-                    f"{snapshot.victim_ip}:score={analysis['attack_probability']:.2f},pps={int(snapshot.pps)}"
+                score = analysis["attack_probability"]
+                kbps = (snapshot.bps * 8) / 1000
+                status = (
+                    "Under Attack"
+                    if analysis["label"] == "ATTACK" and score >= AI_ATTACK_THRESHOLD and snapshot.top_attacker_ip
+                    else "Healthy"
+                )
+                dashboard_state.mark_peer(
+                    peer_ip,
+                    status,
+                    snapshot.pps,
+                    kbps,
+                    score,
+                    attacker_ip=snapshot.top_attacker_ip or "-",
                 )
 
                 if (
                     analysis["label"] == "ATTACK"
-                    and analysis["attack_probability"] >= AI_ATTACK_THRESHOLD
+                    and score >= AI_ATTACK_THRESHOLD
                     and snapshot.top_attacker_ip
                 ):
-                    print(
-                        f"\n[ATTACK DETECTED] victim={snapshot.victim_ip} "
-                        f"attacker={snapshot.top_attacker_ip} "
-                        f"type={analysis['attack_type']} score={analysis['attack_probability']:.3f}"
-                    )
-                    protect_peer(snapshot.top_attacker_ip, snapshot.victim_ip, analysis, snapshot)
+                    protect_peer(snapshot.top_attacker_ip, snapshot.victim_ip, analysis, snapshot, dashboard_state)
 
                 if send_heartbeat:
-                    firewall_manager.send_status_to_backend(
+                    backend_result = firewall_manager.send_status_to_backend(
                         is_attack=False,
                         victim_vpn_ip=snapshot.victim_ip,
                         attack_type=analysis["attack_type"],
-                        attack_probability=analysis["attack_probability"],
+                        attack_probability=score,
                         peer_metrics=snapshot.to_metrics(),
                     )
+                    dashboard_state.set_backend_status("Connected" if backend_result["ok"] else "Degraded")
+                    if not backend_result["ok"]:
+                        dashboard_state.add_event("WARN", backend_result["message"], peer_ip=snapshot.victim_ip)
 
             if send_heartbeat:
                 last_heartbeat = curr_time
-
-            sys.stdout.write(f"\r[STATUS] {' | '.join(peer_summaries[:5])}     ")
-            sys.stdout.flush()
     finally:
         peer_monitor.stop()
 
 
 if __name__ == "__main__":
+    dashboard_state = DashboardState(REGISTERED_PEERS)
+    dashboard_thread = Thread(target=dashboard_worker, args=(dashboard_state,), daemon=True)
+    dashboard_thread.start()
+
     try:
-        discover_gateway_identity()
-        extreme_lockdown()
-        monitor_logic()
+        discovered_identity = discover_gateway_identity()
+        dashboard_state.set_gateway_identity(f"{discovered_identity} on {IDENTITY_INTERFACE}")
+        dashboard_state.add_event("WARN", f"Gateway identity discovered on {IDENTITY_INTERFACE}: {discovered_identity}")
+        firewall_info = extreme_lockdown()
+        dashboard_state.set_backend_status("Connected")
+        dashboard_state.add_event(
+            "WARN",
+            f"Backend ready at {firewall_info['base_url']} ({firewall_info['identity_summary']})",
+        )
+        monitor_logic(dashboard_state)
     except RuntimeError as e:
+        dashboard_state.add_event("ALERT", str(e))
+        dashboard_state.stop_event.set()
+        dashboard_thread.join(timeout=2)
         print(f"[FATAL] {e}")
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\n[SHUTDOWN] BRADSafe: Restoring System...")
+        dashboard_state.add_event("WARN", "Shutdown requested. Restoring firewall state.")
         clear_runtime_blocks()
+        dashboard_state.stop_event.set()
+        dashboard_thread.join(timeout=2)
         sys.exit(0)

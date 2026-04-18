@@ -145,11 +145,26 @@ def send_status_to_backend(
 
         response = requests.post(ALERT_ENDPOINT, json=payload, headers=headers, timeout=1.5)
         if response.status_code in [200, 201]:
-            print(f"[BACKEND] {log_msg}")
+            return {
+                "ok": True,
+                "status_code": response.status_code,
+                "message": log_msg,
+                "payload": payload,
+            }
         else:
-            print(f"[BACKEND] API Error: {response.status_code} - {format_backend_error(response)}")
+            return {
+                "ok": False,
+                "status_code": response.status_code,
+                "message": format_backend_error(response),
+                "payload": payload,
+            }
     except Exception as e:
-        print(f"[BACKEND] Offline or unreachable: {str(e)[:80]}")
+        return {
+            "ok": False,
+            "status_code": None,
+            "message": f"Offline or unreachable: {str(e)[:80]}",
+            "payload": None,
+        }
 
 
 def initialize_firewall():
@@ -163,4 +178,7 @@ def initialize_firewall():
         identifiers.append(f"gateway_peer_ref={GATEWAY_PEER_REF}")
 
     identity_summary = ", ".join(identifiers) if identifiers else "no protected identity configured"
-    print(f"[BACKEND] BRADSafe API Client: Connected to {BASE_URL} ({identity_summary})")
+    return {
+        "base_url": BASE_URL,
+        "identity_summary": identity_summary,
+    }

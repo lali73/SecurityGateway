@@ -16,6 +16,8 @@ class AIAnalyzer:
         
         self.model = None
         self.feature_names = None
+        self.load_error = None
+        self.last_error = None
 
         try:
             # Check if files exist before trying to load them
@@ -26,9 +28,8 @@ class AIAnalyzer:
             if hasattr(self.model, "n_jobs"):
                 self.model.n_jobs = 1
             self.feature_names = joblib.load(self.list_path)
-            print("[AI] Model and feature names loaded successfully")
         except Exception as e:
-            print(f"[AI] Engine error: {e}")
+            self.load_error = str(e)
 
     def predict(self, feature_vector):
         analysis = self.analyze(feature_vector)
@@ -57,7 +58,7 @@ class AIAnalyzer:
                 "attack_type": attack_type,
             }
         except Exception as e:
-            print(f"Prediction Error: {e}")
+            self.last_error = str(e)
             return {
                 "label": "Error",
                 "attack_probability": 0.0,
