@@ -61,12 +61,12 @@ def get_current_vpn_ip():
     return DISCOVERED_VPN_IP
 
 
-def build_identity_payload():
+def build_identity_payload(victim_vpn_ip=None):
     payload = {}
 
-    current_vpn_ip = get_current_vpn_ip()
-    if current_vpn_ip:
-        payload["victim_vpn_ip"] = current_vpn_ip
+    effective_victim_vpn_ip = victim_vpn_ip or get_current_vpn_ip()
+    if effective_victim_vpn_ip:
+        payload["victim_vpn_ip"] = effective_victim_vpn_ip
     if WIREGUARD_PUBLIC_KEY:
         payload["wireguard_public_key"] = WIREGUARD_PUBLIC_KEY
     if GATEWAY_PEER_REF:
@@ -75,8 +75,15 @@ def build_identity_payload():
     return payload
 
 
-def build_alert_payload(is_attack=False, attacker_ip=None):
-    payload = build_identity_payload()
+def build_alert_payload(
+    is_attack=False,
+    attacker_ip=None,
+    victim_vpn_ip=None,
+    attack_type=None,
+    attack_probability=None,
+    peer_metrics=None,
+):
+    payload = build_identity_payload(victim_vpn_ip=victim_vpn_ip)
 
     if not payload:
         raise ValueError(
@@ -88,11 +95,24 @@ def build_alert_payload(is_attack=False, attacker_ip=None):
     payload["event_type"] = "attack_detected" if is_attack else "heartbeat"
     payload["detected_at"] = datetime.now(timezone.utc).isoformat()
     payload["attacker_ip"] = attacker_ip if is_attack else "CLEAN"
+    payload["attack_type"] = attack_type or ("Unknown" if is_attack else "Normal")
+
+    if attack_probability is not None:
+        payload["attack_probability"] = float(attack_probability)
+    if peer_metrics:
+        payload["peer_metrics"] = peer_metrics
 
     return payload
 
 
-def send_status_to_backend(is_attack=False, attacker_ip=None):
+def send_status_to_backend(
+    is_attack=False,
+    attacker_ip=None,
+    victim_vpn_ip=None,
+    attack_type=None,
+    attack_probability=None,
+    peer_metrics=None,
+):
     """
     Coordinates with BRADSafe Backend Route 6.1.
     """
@@ -102,11 +122,26 @@ def send_status_to_backend(is_attack=False, attacker_ip=None):
     }
 
     try:
-        payload = build_alert_payload(is_attack=is_attack, attacker_ip=attacker_ip)
+        payload = build_alert_payload(
+            is_attack=is_attack,
+            attacker_ip=attacker_ip,
+            victim_vpn_ip=victim_vpn_ip,
+            attack_type=attack_type,
+            attack_probability=attack_probability,
+            peer_metrics=peer_metrics,
+        )
         if is_attack:
-            log_msg = f"[ALERT] BRADSafe mitigation sent for {attacker_ip} targeting {payload.get('victim_vpn_ip', 'configured profile')}"
+            log_msg = (
+                f"[ALERT] BRADSafe mitigation sent for {attacker_ip} targeting "
+                f"{payload.get('victim_vpn_ip', 'configured profile')} "
+                f"({payload.get('attack_type', 'Unknown')}, score={payload.get('attack_probability', 'n/a')})"
+            )
         else:
-            log_msg = f"[HEARTBEAT] BRADSafe system status: Healthy for {payload.get('victim_vpn_ip', 'configured profile')}"
+            log_msg = (
+                f"[HEARTBEAT] BRADSafe system status: Healthy for "
+                f"{payload.get('victim_vpn_ip', 'configured profile')} "
+                f"(score={payload.get('attack_probability', 'n/a')})"
+            )
 
         response = requests.post(ALERT_ENDPOINT, json=payload, headers=headers, timeout=1.5)
         if response.status_code in [200, 201]:

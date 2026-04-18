@@ -1,10 +1,9 @@
 import numpy as np
-import time
 from scapy.all import IP
 
 class FeatureExtractor:
     def __init__(self):
-        self.flow_history = {} 
+        self.flow_history = {}
 
     def extract(self, packet):
         if not packet.haslayer(IP):
@@ -30,11 +29,11 @@ class FeatureExtractor:
 
         # --- PREVENT INFINITE PPS ---
         duration_sec = max(ts) - min(ts)
-        
-        # If duration is too small (sub-millisecond), we treat it as 1ms 
+
+        # If duration is too small (sub-millisecond), we treat it as 1ms
         # to avoid exploding PPS/BPS values
-        safe_duration = max(duration_sec, 0.001) 
-        
+        safe_duration = max(duration_sec, 0.001)
+
         duration_ms = float(duration_sec * 1000)
         pps = float(len(ts) / safe_duration)
         bps = float(sum(lens) / safe_duration)
@@ -48,4 +47,18 @@ class FeatureExtractor:
             float(np.std(lens)),
             pps,
             bps
+        ]
+
+    def build_peer_features(self, snapshot):
+        safe_duration = max(snapshot.duration_seconds, 0.001)
+
+        return [
+            int(snapshot.protocol),
+            float(snapshot.duration_seconds * 1000),
+            int(snapshot.packet_count),
+            int(snapshot.byte_count),
+            int(snapshot.max_packet_length),
+            float(snapshot.std_packet_length),
+            float(snapshot.packet_count / safe_duration),
+            float(snapshot.byte_count / safe_duration),
         ]

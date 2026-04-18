@@ -2,16 +2,24 @@ import sys
 import time
 import subprocess
 from core import firewall_manager
-from config.vpn_config import VPN_INTERFACE
+from config.vpn_config import VPN_INTERFACE, VPN_SUBNET
+from core.ai_engine import AIAnalyzer
+from core.feature_extractor import FeatureExtractor
+from core.peer_traffic_monitor import PeerTrafficMonitor
 
 # --- CONFIGURATION ---
 INTERFACE = "ens4"
 IDENTITY_INTERFACE = VPN_INTERFACE
 WHITELIST = ["127.0.0.1", "10.128.0.2"]
-TEST_ATTACKER_IP = "10.128.0.3"
 DISCOVERY_RETRY_SECONDS = 5
 DISCOVERY_TIMEOUT_SECONDS = 60
-blocked_ips = set()
+HEARTBEAT_SECONDS = 10
+DETECTION_INTERVAL_SECONDS = 1
+MONITOR_WINDOW_SECONDS = 5
+AI_ATTACK_THRESHOLD = 0.80
+RAW_BLOCK_CHAIN = "BRADSAFE_RAW"
+FILTER_BLOCK_CHAIN = "BRADSAFE_FILTER"
+blocked_flows = set()
 
 
 def run_quiet(command, check=False):
@@ -24,13 +32,29 @@ def run_quiet(command, check=False):
 
 
 def clear_runtime_blocks():
-    run_quiet(["sudo", "iptables", "-t", "raw", "-F"])
-    run_quiet(["sudo", "iptables", "-F"])
+    run_quiet(["sudo", "iptables", "-t", "raw", "-F", RAW_BLOCK_CHAIN])
+    run_quiet(["sudo", "iptables", "-F", FILTER_BLOCK_CHAIN])
+    blocked_flows.clear()
 
-    for ip in list(blocked_ips) + [TEST_ATTACKER_IP]:
-        run_quiet(["sudo", "ip", "route", "del", "blackhole", ip])
 
-    blocked_ips.clear()
+def ensure_block_chains():
+    run_quiet(["sudo", "iptables", "-t", "raw", "-N", RAW_BLOCK_CHAIN])
+    run_quiet(["sudo", "iptables", "-N", FILTER_BLOCK_CHAIN])
+    if subprocess.run(
+        ["sudo", "iptables", "-t", "raw", "-C", "PREROUTING", "-j", RAW_BLOCK_CHAIN],
+        stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        check=False,
+    ).returncode != 0:
+        run_quiet(["sudo", "iptables", "-t", "raw", "-I", "PREROUTING", "-j", RAW_BLOCK_CHAIN])
+
+    if subprocess.run(
+        ["sudo", "iptables", "-C", "FORWARD", "-j", FILTER_BLOCK_CHAIN],
+        stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        check=False,
+    ).returncode != 0:
+        run_quiet(["sudo", "iptables", "-I", "FORWARD", "-j", FILTER_BLOCK_CHAIN])
 
 
 def get_interface_ipv4(iface):
@@ -85,78 +109,96 @@ def extreme_lockdown():
     print("[INIT] Optimizing BRADSafe Network Driver...")
     run_quiet(["sudo", "ethtool", "-K", INTERFACE, "gro", "off"])
     run_quiet(["sudo", "ethtool", "-K", INTERFACE, "lro", "off"])
+    ensure_block_chains()
     clear_runtime_blocks()
     firewall_manager.initialize_firewall()
     print("[READY] BRADSafe Gateway Ready. Monitoring incoming pulses with a fresh blocklist...")
 
-
-def get_interface_stats(iface):
-    try:
-        with open("/proc/net/dev", "r") as f:
-            for line in f:
-                if iface in line:
-                    return int(line.split()[2])
-    except Exception:
-        return 0
-    return 0
-
-
-def xdp_blackhole(ip):
-    if not ip or ip in WHITELIST or ip in blocked_ips:
+def protect_peer(attacker_ip, victim_ip, analysis, snapshot):
+    flow_key = (attacker_ip, victim_ip)
+    if not attacker_ip or not victim_ip or attacker_ip in WHITELIST or flow_key in blocked_flows:
         return
 
-    print(f"\n[BLOCK] BRADSafe Dropping {ip} at gateway entry...")
+    print(f"\n[BLOCK] BRADSafe Dropping {attacker_ip} traffic targeting {victim_ip}...")
 
-    # Apply multiple drop points so the internal test attacker IP is blocked reliably.
-    run_quiet(["sudo", "iptables", "-t", "raw", "-I", "PREROUTING", "-s", ip, "-j", "DROP"])
-    run_quiet(["sudo", "iptables", "-I", "INPUT", "-s", ip, "-j", "DROP"])
-    run_quiet(["sudo", "iptables", "-I", "FORWARD", "-s", ip, "-j", "DROP"])
-    run_quiet(["sudo", "ip", "route", "replace", "blackhole", ip])
+    run_quiet(
+        ["sudo", "iptables", "-t", "raw", "-A", RAW_BLOCK_CHAIN, "-s", attacker_ip, "-d", victim_ip, "-j", "DROP"]
+    )
+    run_quiet(["sudo", "iptables", "-A", FILTER_BLOCK_CHAIN, "-s", attacker_ip, "-d", victim_ip, "-j", "DROP"])
 
-    firewall_manager.send_status_to_backend(is_attack=True, attacker_ip=ip)
+    firewall_manager.send_status_to_backend(
+        is_attack=True,
+        attacker_ip=attacker_ip,
+        victim_vpn_ip=victim_ip,
+        attack_type=analysis["attack_type"],
+        attack_probability=analysis["attack_probability"],
+        peer_metrics=snapshot.to_metrics(),
+    )
 
-    run_quiet(["sudo", "ip", "link", "set", INTERFACE, "down"], check=True)
-    run_quiet(["sudo", "ip", "link", "set", INTERFACE, "up"], check=True)
-
-    blocked_ips.add(ip)
-    print(f"[LOCKED] {ip} neutralized. BRADSafe Resuming Guard.")
+    blocked_flows.add(flow_key)
+    print(
+        f"[LOCKED] {attacker_ip} -> {victim_ip} neutralized "
+        f"(type={analysis['attack_type']}, score={analysis['attack_probability']:.3f})."
+    )
 
 
 def monitor_logic():
-    prev_pkts = get_interface_stats(INTERFACE)
-    last_check = time.time()
+    peer_monitor = PeerTrafficMonitor(INTERFACE, VPN_SUBNET, window_seconds=MONITOR_WINDOW_SECONDS)
+    feature_extractor = FeatureExtractor()
+    ai_analyzer = AIAnalyzer()
     last_heartbeat = time.time()
 
-    while True:
-        time.sleep(1)
-        curr_pkts = get_interface_stats(INTERFACE)
-        curr_time = time.time()
+    peer_monitor.start()
 
-        delta_p = curr_pkts - prev_pkts
-        duration = max(curr_time - last_check, 0.001)
-        pps = delta_p / duration
+    try:
+        while True:
+            time.sleep(DETECTION_INTERVAL_SECONDS)
+            curr_time = time.time()
+            snapshots = peer_monitor.snapshots(now=curr_time)
 
-        if curr_time - last_heartbeat > 10:
-            firewall_manager.send_status_to_backend(is_attack=False)
-            last_heartbeat = curr_time
-
-        if pps > 1000:
-            attacker_ip = TEST_ATTACKER_IP
-            if attacker_ip not in blocked_ips:
-                print(f"[ATTACK DETECTED] Intensity: {int(pps)} PPS from test source {attacker_ip}")
-                xdp_blackhole(attacker_ip)
-                time.sleep(1)
-                prev_pkts = get_interface_stats(INTERFACE)
+            if not snapshots:
+                sys.stdout.write("\r[STATUS] No active protected peers detected.     ")
+                sys.stdout.flush()
                 continue
-            else:
-                display_pps = int(pps) if pps > 5000 else 0
-                sys.stdout.write(f"\r[STATUS] PPS: {display_pps} | BRADSafe Protected   ")
-        else:
-            sys.stdout.write(f"\r[STATUS] PPS: {int(pps)} | BRADSafe Healthy     ")
 
-        sys.stdout.flush()
-        prev_pkts = curr_pkts
-        last_check = curr_time
+            peer_summaries = []
+            send_heartbeat = curr_time - last_heartbeat >= HEARTBEAT_SECONDS
+
+            for snapshot in snapshots:
+                feature_vector = feature_extractor.build_peer_features(snapshot)
+                analysis = ai_analyzer.analyze(feature_vector)
+                peer_summaries.append(
+                    f"{snapshot.victim_ip}:score={analysis['attack_probability']:.2f},pps={int(snapshot.pps)}"
+                )
+
+                if (
+                    analysis["label"] == "ATTACK"
+                    and analysis["attack_probability"] >= AI_ATTACK_THRESHOLD
+                    and snapshot.top_attacker_ip
+                ):
+                    print(
+                        f"\n[ATTACK DETECTED] victim={snapshot.victim_ip} "
+                        f"attacker={snapshot.top_attacker_ip} "
+                        f"type={analysis['attack_type']} score={analysis['attack_probability']:.3f}"
+                    )
+                    protect_peer(snapshot.top_attacker_ip, snapshot.victim_ip, analysis, snapshot)
+
+                if send_heartbeat:
+                    firewall_manager.send_status_to_backend(
+                        is_attack=False,
+                        victim_vpn_ip=snapshot.victim_ip,
+                        attack_type=analysis["attack_type"],
+                        attack_probability=analysis["attack_probability"],
+                        peer_metrics=snapshot.to_metrics(),
+                    )
+
+            if send_heartbeat:
+                last_heartbeat = curr_time
+
+            sys.stdout.write(f"\r[STATUS] {' | '.join(peer_summaries[:5])}     ")
+            sys.stdout.flush()
+    finally:
+        peer_monitor.stop()
 
 
 if __name__ == "__main__":
