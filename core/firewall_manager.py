@@ -37,6 +37,7 @@ BASE_URL = env_value("BACKEND_BASE_URL", "https://ethics-hits-troubleshooting-sa
 ALERT_ENDPOINT = f"{BASE_URL.rstrip('/')}/api/alerts"
 ALERT_SECRET = env_value("ALERT_SECRET", "BRADSafe_SECURE_2026_PROD")
 DISCOVERED_VPN_IP = None
+PROTECTED_VPN_IP = env_value("PROTECTED_VPN_IP")
 WIREGUARD_PUBLIC_KEY = env_value("WIREGUARD_PUBLIC_KEY")
 GATEWAY_PEER_REF = env_value("GATEWAY_PEER_REF")
 GATEWAY_ID = env_value("GATEWAY_ID", "gateway-dev-1")
@@ -61,15 +62,26 @@ def get_current_vpn_ip():
     return DISCOVERED_VPN_IP
 
 
+def resolve_effective_victim_vpn_ip(victim_vpn_ip=None):
+    return victim_vpn_ip or PROTECTED_VPN_IP or get_current_vpn_ip()
+
+
 def build_identity_payload(victim_vpn_ip=None):
     payload = {}
-
-    effective_victim_vpn_ip = victim_vpn_ip or get_current_vpn_ip()
+    effective_victim_vpn_ip = resolve_effective_victim_vpn_ip(victim_vpn_ip=victim_vpn_ip)
     if effective_victim_vpn_ip:
         payload["victim_vpn_ip"] = effective_victim_vpn_ip
-    if WIREGUARD_PUBLIC_KEY:
+
+    # Static profile identifiers from .env should only accompany the profile they belong to.
+    identity_matches_configured_profile = (
+        not effective_victim_vpn_ip
+        or not PROTECTED_VPN_IP
+        or effective_victim_vpn_ip == PROTECTED_VPN_IP
+    )
+
+    if identity_matches_configured_profile and WIREGUARD_PUBLIC_KEY:
         payload["wireguard_public_key"] = WIREGUARD_PUBLIC_KEY
-    if GATEWAY_PEER_REF:
+    if identity_matches_configured_profile and GATEWAY_PEER_REF:
         payload["gateway_peer_ref"] = GATEWAY_PEER_REF
 
     return payload
@@ -91,7 +103,13 @@ def build_alert_payload(
             "discovered wg0 IPv4, WIREGUARD_PUBLIC_KEY, or GATEWAY_PEER_REF."
         )
 
-    payload["gateway_id"] = GATEWAY_ID
+    effective_victim_vpn_ip = payload.get("victim_vpn_ip")
+    if GATEWAY_ID and (
+        not effective_victim_vpn_ip
+        or not PROTECTED_VPN_IP
+        or effective_victim_vpn_ip == PROTECTED_VPN_IP
+    ):
+        payload["gateway_id"] = GATEWAY_ID
     payload["event_type"] = "attack_detected" if is_attack else "heartbeat"
     payload["detected_at"] = datetime.now(timezone.utc).isoformat()
     payload["attacker_ip"] = attacker_ip if is_attack else "CLEAN"
@@ -169,9 +187,9 @@ def send_status_to_backend(
 
 def initialize_firewall():
     identifiers = []
-    current_vpn_ip = get_current_vpn_ip()
-    if current_vpn_ip:
-        identifiers.append(f"vpn_ip={current_vpn_ip}")
+    effective_vpn_ip = PROTECTED_VPN_IP or get_current_vpn_ip()
+    if effective_vpn_ip:
+        identifiers.append(f"vpn_ip={effective_vpn_ip}")
     if WIREGUARD_PUBLIC_KEY:
         identifiers.append("wireguard_public_key=configured")
     if GATEWAY_PEER_REF:
