@@ -104,11 +104,9 @@ def build_alert_payload(
         )
 
     effective_victim_vpn_ip = payload.get("victim_vpn_ip")
-    if GATEWAY_ID and (
-        not effective_victim_vpn_ip
-        or not PROTECTED_VPN_IP
-        or effective_victim_vpn_ip == PROTECTED_VPN_IP
-    ):
+    # Per-peer alerts should identify the protected user by that peer's identity only.
+    # A static gateway_id can map to a different backend profile and cause conflicts.
+    if GATEWAY_ID and not effective_victim_vpn_ip:
         payload["gateway_id"] = GATEWAY_ID
     payload["event_type"] = "attack_detected" if is_attack else "heartbeat"
     payload["detected_at"] = datetime.now(timezone.utc).isoformat()
