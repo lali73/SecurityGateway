@@ -59,7 +59,7 @@ class PeerTrafficMonitor:
             iface=self.interface,
             prn=self.handle_packet,
             store=False,
-            filter=f"ip and dst net {self.vpn_network.with_prefixlen}",
+            filter=f"ip and (src net {self.vpn_network.with_prefixlen} or dst net {self.vpn_network.with_prefixlen})",
         )
         self.sniffer.start()
 
@@ -76,17 +76,29 @@ class PeerTrafficMonitor:
         if not packet.haslayer(IP):
             return
 
+        src_ip = packet[IP].src
         dst_ip = packet[IP].dst
         try:
-            if ipaddress.ip_address(dst_ip) not in self.vpn_network:
+            src_in_vpn = ipaddress.ip_address(src_ip) in self.vpn_network
+            dst_in_vpn = ipaddress.ip_address(dst_ip) in self.vpn_network
+            if not src_in_vpn and not dst_in_vpn:
                 return
         except ValueError:
             return
 
+        if src_in_vpn and not dst_in_vpn:
+            peer_ip = src_ip
+            remote_ip = dst_ip
+        elif dst_in_vpn and not src_in_vpn:
+            peer_ip = dst_ip
+            remote_ip = src_ip
+        else:
+            peer_ip = dst_ip
+            remote_ip = src_ip
+
         now = float(packet.time)
         proto = int(packet[IP].proto)
         length = len(packet)
-        src_ip = packet[IP].src
         is_syn = bool(
             packet.haslayer(TCP)
             and packet[TCP].flags & 0x02
@@ -96,11 +108,11 @@ class PeerTrafficMonitor:
         is_udp = packet.haslayer(UDP)
 
         with self.lock:
-            peer_queue = self.peer_packets.setdefault(dst_ip, deque())
+            peer_queue = self.peer_packets.setdefault(peer_ip, deque())
             peer_queue.append(
                 {
                     "ts": now,
-                    "src_ip": src_ip,
+                    "src_ip": remote_ip,
                     "proto": proto,
                     "length": length,
                     "is_tcp": is_tcp,
@@ -108,7 +120,7 @@ class PeerTrafficMonitor:
                     "is_syn": is_syn,
                 }
             )
-            self._prune_peer(dst_ip, now)
+            self._prune_peer(peer_ip, now)
 
     def _prune_peer(self, victim_ip, now):
         peer_queue = self.peer_packets.get(victim_ip)

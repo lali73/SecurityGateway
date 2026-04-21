@@ -18,6 +18,7 @@ from rich.text import Text
 
 # --- CONFIGURATION ---
 INTERFACE = "ens4"
+MONITOR_INTERFACE = VPN_INTERFACE
 IDENTITY_INTERFACE = VPN_INTERFACE
 WHITELIST = ["127.0.0.1", "10.128.0.2"]
 REGISTERED_PEERS = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.5"]
@@ -71,6 +72,10 @@ class DashboardState:
         if peer_ip not in self.registered_peers:
             self.registered_peers.append(peer_ip)
             self.registered_peers.sort(key=lambda ip: tuple(int(part) for part in ip.split(".")))
+
+    def register_peer(self, peer_ip):
+        with self.lock:
+            self.ensure_peer(peer_ip)
 
     def set_ai_status(self, status):
         with self.lock:
@@ -189,7 +194,7 @@ def build_peer_table(snapshot):
         table.add_row(
             peer_ip,
             status_text(row.get("status", "Healthy"), pulse_on),
-            f"{row.get('pps', 0.0):,.0f}",
+            f"{row.get('pps', 0.0):,.1f}",
             f"{row.get('kbps', 0.0):,.1f}",
             f"{row.get('score', 0.0):.3f}",
         )
@@ -370,7 +375,7 @@ def protect_peer(attacker_ip, victim_ip, analysis, snapshot, dashboard_state):
 
 
 def monitor_logic(dashboard_state):
-    peer_monitor = PeerTrafficMonitor(INTERFACE, VPN_SUBNET, window_seconds=MONITOR_WINDOW_SECONDS)
+    peer_monitor = PeerTrafficMonitor(MONITOR_INTERFACE, VPN_SUBNET, window_seconds=MONITOR_WINDOW_SECONDS)
     feature_extractor = FeatureExtractor()
     ai_analyzer = AIAnalyzer()
     last_heartbeat = time.time()
@@ -387,7 +392,7 @@ def monitor_logic(dashboard_state):
             snapshots = peer_monitor.snapshots(now=curr_time)
 
             for snapshot in snapshots:
-                dashboard_state.mark_peer(snapshot.victim_ip, "Healthy", 0.0, 0.0, 0.0)
+                dashboard_state.register_peer(snapshot.victim_ip)
 
             snapshot_by_peer = {snapshot.victim_ip: snapshot for snapshot in snapshots}
             global_pps = sum(snapshot.pps for snapshot in snapshots)
