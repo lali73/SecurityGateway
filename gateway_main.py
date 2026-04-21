@@ -21,15 +21,16 @@ INTERFACE = "ens4"
 MONITOR_INTERFACE = VPN_INTERFACE
 IDENTITY_INTERFACE = VPN_INTERFACE
 WHITELIST = ["127.0.0.1", "10.128.0.2"]
-REGISTERED_PEERS = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.5"]
 DISCOVERY_RETRY_SECONDS = 5
 DISCOVERY_TIMEOUT_SECONDS = 60
 HEARTBEAT_SECONDS = 10
 DETECTION_INTERVAL_SECONDS = 1
 MONITOR_WINDOW_SECONDS = 5
-AI_ATTACK_THRESHOLD = 0.80
+AI_ATTACK_THRESHOLD = 0.50
+MIN_ATTACK_PPS = 5000
 UNDER_ATTACK_HOLD_SECONDS = 8
 INCIDENT_HISTORY_SIZE = 10
+PEER_REGISTRY_REFRESH_SECONDS = 10
 RAW_BLOCK_CHAIN = "BRADSAFE_RAW"
 FILTER_BLOCK_CHAIN = "BRADSAFE_FILTER"
 blocked_flows = set()
@@ -156,6 +157,16 @@ def status_text(status, pulse_on):
     return Text("HEALTHY", style="bold green")
 
 
+def should_treat_as_attack(analysis, snapshot):
+    if analysis["label"] != "ATTACK":
+        return False
+
+    if snapshot.pps < MIN_ATTACK_PPS:
+        return False
+
+    return analysis["attack_probability"] >= AI_ATTACK_THRESHOLD
+
+
 def build_header_panel(snapshot):
     grid = Table.grid(expand=True)
     grid.add_column(justify="left", ratio=2)
@@ -253,6 +264,56 @@ def run_quiet(command, check=False):
         stdout=subprocess.DEVNULL,
         check=check,
     )
+
+
+def discover_registered_peers():
+    try:
+        result = subprocess.run(
+            ["wg", "show", IDENTITY_INTERFACE, "allowed-ips"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return []
+
+    if result.returncode != 0:
+        return []
+
+    peers = set()
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+
+        for allowed_ip in parts[1].split(","):
+            candidate = allowed_ip.strip()
+            if "/" in candidate:
+                ip_value, prefix = candidate.split("/", 1)
+                if prefix != "32":
+                    continue
+            else:
+                ip_value = candidate
+
+            try:
+                peer_ip = tuple(int(part) for part in ip_value.split("."))
+            except ValueError:
+                continue
+
+            if len(peer_ip) != 4:
+                continue
+            if ip_value == firewall_manager.get_current_vpn_ip():
+                continue
+            if not ip_value.startswith("10.0.0."):
+                continue
+
+            peers.add(ip_value)
+
+    return sorted(peers, key=lambda ip: tuple(int(part) for part in ip.split(".")))
 
 
 def clear_runtime_blocks():
@@ -379,6 +440,7 @@ def monitor_logic(dashboard_state):
     feature_extractor = FeatureExtractor()
     ai_analyzer = AIAnalyzer()
     last_heartbeat = time.time()
+    last_peer_registry_refresh = 0.0
     dashboard_state.set_ai_status("Active" if ai_analyzer.model is not None else "Load Error")
     if ai_analyzer.load_error:
         dashboard_state.add_event("WARN", ai_analyzer.load_error)
@@ -389,6 +451,12 @@ def monitor_logic(dashboard_state):
         while True:
             time.sleep(DETECTION_INTERVAL_SECONDS)
             curr_time = time.time()
+
+            if curr_time - last_peer_registry_refresh >= PEER_REGISTRY_REFRESH_SECONDS:
+                for peer_ip in discover_registered_peers():
+                    dashboard_state.register_peer(peer_ip)
+                last_peer_registry_refresh = curr_time
+
             snapshots = peer_monitor.snapshots(now=curr_time)
 
             for snapshot in snapshots:
@@ -414,11 +482,8 @@ def monitor_logic(dashboard_state):
                 analysis = ai_analyzer.analyze(feature_vector)
                 score = analysis["attack_probability"]
                 kbps = (snapshot.bps * 8) / 1000
-                status = (
-                    "Under Attack"
-                    if analysis["label"] == "ATTACK" and score >= AI_ATTACK_THRESHOLD and snapshot.top_attacker_ip
-                    else "Healthy"
-                )
+                is_attack = should_treat_as_attack(analysis, snapshot) and bool(snapshot.top_attacker_ip)
+                status = "Under Attack" if is_attack else "Healthy"
                 dashboard_state.mark_peer(
                     peer_ip,
                     status,
@@ -428,11 +493,7 @@ def monitor_logic(dashboard_state):
                     attacker_ip=snapshot.top_attacker_ip or "-",
                 )
 
-                if (
-                    analysis["label"] == "ATTACK"
-                    and score >= AI_ATTACK_THRESHOLD
-                    and snapshot.top_attacker_ip
-                ):
+                if is_attack:
                     protect_peer(snapshot.top_attacker_ip, snapshot.victim_ip, analysis, snapshot, dashboard_state)
 
                 if send_heartbeat:
@@ -454,7 +515,7 @@ def monitor_logic(dashboard_state):
 
 
 if __name__ == "__main__":
-    dashboard_state = DashboardState(REGISTERED_PEERS)
+    dashboard_state = DashboardState(discover_registered_peers())
     dashboard_thread = Thread(target=dashboard_worker, args=(dashboard_state,), daemon=True)
     dashboard_thread.start()
 
