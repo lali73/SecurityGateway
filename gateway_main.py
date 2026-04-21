@@ -31,6 +31,12 @@ MIN_ATTACK_PPS = 1800
 UNDER_ATTACK_HOLD_SECONDS = 8
 INCIDENT_HISTORY_SIZE = 10
 PEER_REGISTRY_REFRESH_SECONDS = 10
+MANUAL_ATTACK_SCORE = 0.51
+MANUAL_SOURCE_SHARE_THRESHOLD = 0.60
+MANUAL_ATTACKER_PPS_THRESHOLD = 900
+MANUAL_UDP_RATIO_THRESHOLD = 0.85
+MANUAL_SYN_RATIO_THRESHOLD = 0.45
+MANUAL_EXTREME_PPS = 5000
 RAW_BLOCK_CHAIN = "BRADSAFE_RAW"
 FILTER_BLOCK_CHAIN = "BRADSAFE_FILTER"
 blocked_flows = set()
@@ -158,13 +164,74 @@ def status_text(status, pulse_on):
 
 
 def should_treat_as_attack(analysis, snapshot):
-    if analysis["label"] != "ATTACK":
+    if snapshot.pps < MIN_ATTACK_PPS or not snapshot.top_attacker_ip:
         return False
 
-    if snapshot.pps < MIN_ATTACK_PPS:
-        return False
+    if analysis["label"] == "ATTACK" and analysis["attack_probability"] >= AI_ATTACK_THRESHOLD:
+        return True
 
-    return analysis["attack_probability"] >= AI_ATTACK_THRESHOLD
+    return analysis.get("manual_attack", False)
+
+
+def manual_firewall_analysis(snapshot):
+    safe_duration = max(snapshot.duration_seconds, 0.001)
+    attacker_share = snapshot.attacker_packet_count / max(snapshot.packet_count, 1)
+    attacker_pps = snapshot.attacker_packet_count / safe_duration
+
+    if attacker_share < MANUAL_SOURCE_SHARE_THRESHOLD or attacker_pps < MANUAL_ATTACKER_PPS_THRESHOLD:
+        return None
+
+    if snapshot.protocol == 6 and snapshot.syn_ratio >= MANUAL_SYN_RATIO_THRESHOLD:
+        return {
+            "label": "ATTACK",
+            "attack_probability": MANUAL_ATTACK_SCORE,
+            "attack_type": "SynFlood",
+            "manual_attack": True,
+        }
+
+    if snapshot.protocol == 17 and snapshot.udp_ratio >= MANUAL_UDP_RATIO_THRESHOLD:
+        return {
+            "label": "ATTACK",
+            "attack_probability": MANUAL_ATTACK_SCORE,
+            "attack_type": "UDP Flood",
+            "manual_attack": True,
+        }
+
+    if snapshot.pps >= MANUAL_EXTREME_PPS:
+        return {
+            "label": "ATTACK",
+            "attack_probability": MANUAL_ATTACK_SCORE,
+            "attack_type": "Packet Flood",
+            "manual_attack": True,
+        }
+
+    return {
+        "label": "ATTACK",
+        "attack_probability": MANUAL_ATTACK_SCORE,
+        "attack_type": "Suspicious Flood",
+        "manual_attack": True,
+    }
+
+
+def attack_analysis_for_demo(analysis, snapshot):
+    normalized = {
+        "label": analysis.get("label", "Normal"),
+        "attack_probability": float(analysis.get("attack_probability", 0.0)),
+        "attack_type": analysis.get("attack_type", "Normal"),
+        "manual_attack": False,
+    }
+
+    if snapshot.pps < MIN_ATTACK_PPS or not snapshot.top_attacker_ip:
+        return normalized
+
+    if normalized["label"] == "ATTACK" and normalized["attack_probability"] >= AI_ATTACK_THRESHOLD:
+        return normalized
+
+    manual_analysis = manual_firewall_analysis(snapshot)
+    if manual_analysis is not None:
+        return manual_analysis
+
+    return normalized
 
 
 def build_header_panel(snapshot):
@@ -423,7 +490,8 @@ def protect_peer(attacker_ip, victim_ip, analysis, snapshot, dashboard_state):
         "ALERT",
         (
             f"Victim {victim_ip} under {analysis['attack_type']} pressure. "
-            f"Neutralizing source {attacker_ip}."
+            f"Neutralizing source {attacker_ip}"
+            f"{' via firewall fallback.' if analysis.get('manual_attack') else '.'}"
         ),
         peer_ip=victim_ip,
         attacker_ip=attacker_ip,
@@ -479,7 +547,7 @@ def monitor_logic(dashboard_state):
                     continue
 
                 feature_vector = feature_extractor.build_peer_features(snapshot)
-                analysis = ai_analyzer.analyze(feature_vector)
+                analysis = attack_analysis_for_demo(ai_analyzer.analyze(feature_vector), snapshot)
                 score = analysis["attack_probability"]
                 kbps = (snapshot.bps * 8) / 1000
                 is_attack = should_treat_as_attack(analysis, snapshot) and bool(snapshot.top_attacker_ip)
@@ -518,6 +586,7 @@ if __name__ == "__main__":
     dashboard_state = DashboardState(discover_registered_peers())
     dashboard_thread = Thread(target=dashboard_worker, args=(dashboard_state,), daemon=True)
     dashboard_thread.start()
+    exit_code = 0
 
     try:
         discovered_identity = discover_gateway_identity()
@@ -525,6 +594,7 @@ if __name__ == "__main__":
         dashboard_state.add_event("WARN", f"Gateway identity discovered on {IDENTITY_INTERFACE}: {discovered_identity}")
         firewall_info = extreme_lockdown()
         dashboard_state.set_backend_status("Connected")
+        dashboard_state.add_event("WARN", "Demo mode startup: cleared all runtime firewall blocks from previous runs.")
         dashboard_state.add_event(
             "WARN",
             f"Backend ready at {firewall_info['base_url']} ({firewall_info['identity_summary']})",
@@ -532,13 +602,13 @@ if __name__ == "__main__":
         monitor_logic(dashboard_state)
     except RuntimeError as e:
         dashboard_state.add_event("ALERT", str(e))
-        dashboard_state.stop_event.set()
-        dashboard_thread.join(timeout=2)
         print(f"[FATAL] {e}")
-        sys.exit(1)
+        exit_code = 1
     except KeyboardInterrupt:
         dashboard_state.add_event("WARN", "Shutdown requested. Restoring firewall state.")
+    finally:
         clear_runtime_blocks()
         dashboard_state.stop_event.set()
         dashboard_thread.join(timeout=2)
-        sys.exit(0)
+
+    sys.exit(exit_code)
