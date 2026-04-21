@@ -34,6 +34,9 @@ PEER_REGISTRY_REFRESH_SECONDS = 10
 MANUAL_ATTACK_SCORE = 0.51
 MANUAL_SOURCE_SHARE_THRESHOLD = 0.60
 MANUAL_ATTACKER_PPS_THRESHOLD = 900
+MANUAL_ICMP_ATTACKER_PPS_THRESHOLD = 150
+MANUAL_TCP_ATTACKER_PPS_THRESHOLD = 700
+MANUAL_UDP_ATTACKER_PPS_THRESHOLD = 700
 MANUAL_UDP_RATIO_THRESHOLD = 0.85
 MANUAL_SYN_RATIO_THRESHOLD = 0.45
 MANUAL_EXTREME_PPS = 5000
@@ -164,13 +167,26 @@ def status_text(status, pulse_on):
 
 
 def should_treat_as_attack(analysis, snapshot):
-    if snapshot.pps < MIN_ATTACK_PPS or not snapshot.top_attacker_ip:
+    if not snapshot.top_attacker_ip:
         return False
 
-    if analysis["label"] == "ATTACK" and analysis["attack_probability"] >= AI_ATTACK_THRESHOLD:
+    if (
+        snapshot.pps >= MIN_ATTACK_PPS
+        and analysis["label"] == "ATTACK"
+        and analysis["attack_probability"] >= AI_ATTACK_THRESHOLD
+    ):
         return True
 
     return analysis.get("manual_attack", False)
+
+
+def manual_attack_result(attack_type):
+    return {
+        "label": "ATTACK",
+        "attack_probability": MANUAL_ATTACK_SCORE,
+        "attack_type": attack_type,
+        "manual_attack": True,
+    }
 
 
 def manual_firewall_analysis(snapshot):
@@ -178,39 +194,29 @@ def manual_firewall_analysis(snapshot):
     attacker_share = snapshot.attacker_packet_count / max(snapshot.packet_count, 1)
     attacker_pps = snapshot.attacker_packet_count / safe_duration
 
-    if attacker_share < MANUAL_SOURCE_SHARE_THRESHOLD or attacker_pps < MANUAL_ATTACKER_PPS_THRESHOLD:
+    if not snapshot.top_attacker_ip or attacker_share < MANUAL_SOURCE_SHARE_THRESHOLD:
         return None
 
-    if snapshot.protocol == 6 and snapshot.syn_ratio >= MANUAL_SYN_RATIO_THRESHOLD:
-        return {
-            "label": "ATTACK",
-            "attack_probability": MANUAL_ATTACK_SCORE,
-            "attack_type": "SynFlood",
-            "manual_attack": True,
-        }
+    if snapshot.protocol == 1 and attacker_pps >= MANUAL_ICMP_ATTACKER_PPS_THRESHOLD:
+        return manual_attack_result("ICMP Flood")
 
-    if snapshot.protocol == 17 and snapshot.udp_ratio >= MANUAL_UDP_RATIO_THRESHOLD:
-        return {
-            "label": "ATTACK",
-            "attack_probability": MANUAL_ATTACK_SCORE,
-            "attack_type": "UDP Flood",
-            "manual_attack": True,
-        }
+    if snapshot.protocol == 6 and attacker_pps >= MANUAL_TCP_ATTACKER_PPS_THRESHOLD:
+        if snapshot.syn_ratio >= MANUAL_SYN_RATIO_THRESHOLD:
+            return manual_attack_result("SYN Flood")
+        return manual_attack_result("TCP Flood")
+
+    if snapshot.protocol == 17 and attacker_pps >= MANUAL_UDP_ATTACKER_PPS_THRESHOLD:
+        if snapshot.udp_ratio >= MANUAL_UDP_RATIO_THRESHOLD:
+            return manual_attack_result("UDP Flood")
+        return manual_attack_result("UDP Burst Flood")
 
     if snapshot.pps >= MANUAL_EXTREME_PPS:
-        return {
-            "label": "ATTACK",
-            "attack_probability": MANUAL_ATTACK_SCORE,
-            "attack_type": "Packet Flood",
-            "manual_attack": True,
-        }
+        return manual_attack_result("High-Rate Packet Flood")
 
-    return {
-        "label": "ATTACK",
-        "attack_probability": MANUAL_ATTACK_SCORE,
-        "attack_type": "Suspicious Flood",
-        "manual_attack": True,
-    }
+    if attacker_pps >= MANUAL_ATTACKER_PPS_THRESHOLD:
+        return manual_attack_result("Dominant-Source Flood")
+
+    return None
 
 
 def attack_analysis_for_demo(analysis, snapshot):
@@ -221,10 +227,14 @@ def attack_analysis_for_demo(analysis, snapshot):
         "manual_attack": False,
     }
 
-    if snapshot.pps < MIN_ATTACK_PPS or not snapshot.top_attacker_ip:
+    if not snapshot.top_attacker_ip:
         return normalized
 
-    if normalized["label"] == "ATTACK" and normalized["attack_probability"] >= AI_ATTACK_THRESHOLD:
+    if (
+        snapshot.pps >= MIN_ATTACK_PPS
+        and normalized["label"] == "ATTACK"
+        and normalized["attack_probability"] >= AI_ATTACK_THRESHOLD
+    ):
         return normalized
 
     manual_analysis = manual_firewall_analysis(snapshot)
