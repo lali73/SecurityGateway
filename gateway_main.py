@@ -33,6 +33,7 @@ MIN_ATTACK_PPS = 1800
 UNDER_ATTACK_HOLD_SECONDS = 8
 INCIDENT_HISTORY_SIZE = 10
 PEER_REGISTRY_REFRESH_SECONDS = 10
+PEER_KEY_REFRESH_SECONDS = 10
 MANUAL_ATTACK_SCORE = 0.51
 MANUAL_SOURCE_SHARE_THRESHOLD = 0.60
 MANUAL_ATTACKER_PPS_THRESHOLD = 900
@@ -47,7 +48,6 @@ RAW_BLOCK_CHAIN = "BRADSAFE_RAW"
 FILTER_BLOCK_CHAIN = "BRADSAFE_FILTER"
 blocked_flows = set()
 NEVER_BLOCK_NETWORKS = (
-    ipaddress.ip_network("10.0.0.0/24"),
     ipaddress.ip_network("127.0.0.0/8"),
 )
 
@@ -342,6 +342,10 @@ def dashboard_worker(state):
 
 
 def run_quiet(command, check=False):
+    if "iptables" in command and "-F" in command:
+        print("[WARN] Refusing to execute forbidden iptables flush command: iptables -F")
+        return subprocess.CompletedProcess(command, 1)
+
     return subprocess.run(
         command,
         stderr=subprocess.DEVNULL,
@@ -410,6 +414,59 @@ def discover_registered_peers():
             peers.add(ip_value)
 
     return sorted(peers, key=lambda ip: tuple(int(part) for part in ip.split(".")))
+
+
+def discover_peer_public_keys():
+    try:
+        result = subprocess.run(
+            ["wg", "show", "wg0", "dump"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return {}
+
+    if result.returncode != 0:
+        return {}
+
+    peer_keys = {}
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return peer_keys
+
+    for line in lines[1:]:
+        parts = line.split("\t")
+        if len(parts) < 4:
+            parts = line.split()
+        if len(parts) < 4:
+            continue
+
+        peer_public_key = parts[0].strip()
+        allowed_ips = parts[3].strip()
+        if not peer_public_key or not allowed_ips:
+            continue
+
+        for allowed_ip in allowed_ips.split(","):
+            candidate = allowed_ip.strip()
+            if not candidate:
+                continue
+            if "/" in candidate:
+                ip_value, prefix = candidate.split("/", 1)
+                if prefix != "32":
+                    continue
+            else:
+                ip_value = candidate
+
+            try:
+                ip_obj = ipaddress.ip_address(ip_value)
+            except ValueError:
+                continue
+
+            if ip_obj.version == 4:
+                peer_keys[ip_value] = peer_public_key
+
+    return peer_keys
 
 
 def clear_runtime_blocks():
@@ -510,7 +567,7 @@ def extreme_lockdown():
     clear_runtime_blocks()
     return firewall_manager.initialize_firewall()
 
-def protect_peer(attacker_ip, victim_ip, analysis, snapshot, dashboard_state):
+def protect_peer(attacker_ip, victim_ip, analysis, snapshot, dashboard_state, victim_peer_key):
     flow_key = (attacker_ip, victim_ip)
     if (
         not attacker_ip
@@ -537,6 +594,17 @@ def protect_peer(attacker_ip, victim_ip, analysis, snapshot, dashboard_state):
     )
     run_quiet(["sudo", "iptables", "-A", FILTER_BLOCK_CHAIN, "-s", attacker_ip, "-d", victim_ip, "-j", "DROP"])
 
+    if victim_peer_key is None:
+        dashboard_state.add_event(
+            "WARN",
+            (
+                f"No WireGuard peer public key found for victim {victim_ip}. "
+                "Sending alert with wireguard_public_key=null."
+            ),
+            peer_ip=victim_ip,
+            attacker_ip=attacker_ip,
+        )
+
     backend_result = firewall_manager.send_status_to_backend(
         is_attack=True,
         attacker_ip=attacker_ip,
@@ -544,6 +612,7 @@ def protect_peer(attacker_ip, victim_ip, analysis, snapshot, dashboard_state):
         attack_type=analysis["attack_type"],
         attack_probability=analysis["attack_probability"],
         peer_metrics=snapshot.to_metrics(),
+        wireguard_public_key_override=victim_peer_key,
     )
 
     blocked_flows.add(flow_key)
@@ -578,6 +647,8 @@ def monitor_logic(dashboard_state):
     ai_analyzer = AIAnalyzer()
     last_heartbeat = time.time()
     last_peer_registry_refresh = 0.0
+    last_peer_key_refresh = 0.0
+    peer_key_map = {}
     attacker_strikes = {}
     dashboard_state.set_ai_status("Active" if ai_analyzer.model is not None else "Load Error")
     if ai_analyzer.load_error:
@@ -594,6 +665,9 @@ def monitor_logic(dashboard_state):
                 for peer_ip in discover_registered_peers():
                     dashboard_state.register_peer(peer_ip)
                 last_peer_registry_refresh = curr_time
+            if curr_time - last_peer_key_refresh >= PEER_KEY_REFRESH_SECONDS:
+                peer_key_map = discover_peer_public_keys()
+                last_peer_key_refresh = curr_time
 
             snapshots = peer_monitor.snapshots(now=curr_time)
 
@@ -651,7 +725,15 @@ def monitor_logic(dashboard_state):
                 )
 
                 if is_attack:
-                    protect_peer(attacker_ip, snapshot.victim_ip, analysis, snapshot, dashboard_state)
+                    victim_peer_key = peer_key_map.get(snapshot.victim_ip)
+                    protect_peer(
+                        attacker_ip,
+                        snapshot.victim_ip,
+                        analysis,
+                        snapshot,
+                        dashboard_state,
+                        victim_peer_key=victim_peer_key,
+                    )
 
                 if send_heartbeat:
                     backend_result = firewall_manager.send_status_to_backend(

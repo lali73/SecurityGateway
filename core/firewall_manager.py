@@ -3,6 +3,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 import requests
+_UNSET = object()
 
 
 def load_env_file(env_path):
@@ -33,7 +34,7 @@ def env_value(key, default=None):
     return value
 
 # --- BACKEND CONFIGURATION ---
-BASE_URL = env_value("BACKEND_BASE_URL", "https://ethics-hits-troubleshooting-sas.trycloudflare.com")
+BASE_URL = env_value("BACKEND_BASE_URL", "https://declaration-coating-lab-tips.trycloudflare.com")
 ALERT_ENDPOINT = f"{BASE_URL.rstrip('/')}/api/alerts"
 ALERT_SECRET = env_value("ALERT_SECRET", "BRADSafe_SECURE_2026_PROD")
 DISCOVERED_VPN_IP = None
@@ -66,16 +67,19 @@ def resolve_effective_victim_vpn_ip(victim_vpn_ip=None):
     return victim_vpn_ip or PROTECTED_VPN_IP or get_current_vpn_ip()
 
 
-def build_identity_payload(victim_vpn_ip=None):
+def build_identity_payload(victim_vpn_ip=None, wireguard_public_key_override=_UNSET):
     payload = {}
     effective_victim_vpn_ip = resolve_effective_victim_vpn_ip(victim_vpn_ip=victim_vpn_ip)
     if effective_victim_vpn_ip:
         payload["victim_vpn_ip"] = effective_victim_vpn_ip
 
-    # Key-first identity: always include WireGuard public key when configured so
-    # backend resolution can survive VPN IP drift.
-    if WIREGUARD_PUBLIC_KEY:
-        payload["wireguard_public_key"] = WIREGUARD_PUBLIC_KEY
+    # Key-first identity: for per-peer attack alerts we override with the victim's
+    # peer key. If missing, explicit null is sent to avoid wrong profile mapping.
+    if wireguard_public_key_override is _UNSET:
+        if WIREGUARD_PUBLIC_KEY:
+            payload["wireguard_public_key"] = WIREGUARD_PUBLIC_KEY
+    else:
+        payload["wireguard_public_key"] = wireguard_public_key_override
     # Keep peer ref scoped to configured profile to avoid profile collisions.
     identity_matches_configured_profile = (
         not effective_victim_vpn_ip
@@ -95,8 +99,12 @@ def build_alert_payload(
     attack_type=None,
     attack_probability=None,
     peer_metrics=None,
+    wireguard_public_key_override=_UNSET,
 ):
-    payload = build_identity_payload(victim_vpn_ip=victim_vpn_ip)
+    payload = build_identity_payload(
+        victim_vpn_ip=victim_vpn_ip,
+        wireguard_public_key_override=wireguard_public_key_override,
+    )
 
     if not payload:
         raise ValueError(
@@ -131,6 +139,7 @@ def send_status_to_backend(
     attack_type=None,
     attack_probability=None,
     peer_metrics=None,
+    wireguard_public_key_override=_UNSET,
 ):
     """
     Coordinates with BRADSafe Backend Route 6.1.
@@ -148,6 +157,7 @@ def send_status_to_backend(
             attack_type=attack_type,
             attack_probability=attack_probability,
             peer_metrics=peer_metrics,
+            wireguard_public_key_override=wireguard_public_key_override,
         )
         if is_attack:
             ip_drift_detected = (
