@@ -19,7 +19,7 @@ from rich.table import Table
 from rich.text import Text
 
 # --- CONFIGURATION ---
-INTERFACE = "ens4"
+DEFAULT_WAN_INTERFACE = "eth0"
 MONITOR_INTERFACE = VPN_INTERFACE
 IDENTITY_INTERFACE = VPN_INTERFACE
 WHITELIST = ["127.0.0.1", "10.128.0.2"]
@@ -30,6 +30,7 @@ DETECTION_INTERVAL_SECONDS = 1
 MONITOR_WINDOW_SECONDS = 5
 AI_ATTACK_THRESHOLD = 0.50
 MIN_ATTACK_PPS = 1800
+PPS_THRESHOLD = MIN_ATTACK_PPS
 UNDER_ATTACK_HOLD_SECONDS = 8
 INCIDENT_HISTORY_SIZE = 10
 PEER_REGISTRY_REFRESH_SECONDS = 10
@@ -46,6 +47,8 @@ STRIKE_TRIGGER_COUNT = 3
 RAW_BLOCK_CHAIN = "BRADSAFE_RAW"
 FILTER_BLOCK_CHAIN = "BRADSAFE_FILTER"
 ALERT_WG_KEY_FALLBACK = "bbPDmx8Wp5A93d5aUnhZizpv4WaBtR3oV53SwBLR7HQ="
+IPTABLES_BIN = "/usr/sbin/iptables"
+BLOCK_INTERFACE = None
 blocked_flows = set()
 NEVER_BLOCK_NETWORKS = (
     ipaddress.ip_network("127.0.0.0/8"),
@@ -342,7 +345,7 @@ def dashboard_worker(state):
 
 
 def run_quiet(command, check=False):
-    if "iptables" in command and "-F" in command:
+    if IPTABLES_BIN in command and "-F" in command:
         print("[WARN] Refusing to execute forbidden iptables flush command: iptables -F")
         return subprocess.CompletedProcess(command, 1)
 
@@ -352,6 +355,137 @@ def run_quiet(command, check=False):
         stdout=subprocess.DEVNULL,
         check=check,
     )
+
+
+def run_iptables(args, dashboard_state=None, report_error=True):
+    command = ["sudo", IPTABLES_BIN] + args
+    if "-F" in args:
+        msg = "[WARN] Refusing to execute forbidden iptables flush command: iptables -F"
+        print(msg)
+        if dashboard_state:
+            dashboard_state.add_event("WARN", msg)
+        return subprocess.CompletedProcess(command, 1, "", "iptables -F is forbidden")
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if report_error and result.returncode != 0:
+        stderr = (result.stderr or "").strip() or "unknown iptables error"
+        msg = f"[IPTABLES ERROR] {' '.join(command)} -> {stderr}"
+        print(msg)
+        if dashboard_state:
+            dashboard_state.add_event("WARN", msg)
+    return result
+
+
+def get_interface_for_ipv4(ip_value):
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        iface = parts[1]
+        cidr = parts[3]
+        if "/" not in cidr:
+            continue
+        ip_addr = cidr.split("/", 1)[0]
+        if ip_addr == ip_value:
+            return iface
+
+    return None
+
+
+def get_default_wan_interface():
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "route", "show", "default"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    if result.returncode == 0:
+        for raw_line in result.stdout.splitlines():
+            parts = raw_line.strip().split()
+            if "dev" in parts:
+                idx = parts.index("dev")
+                if idx + 1 < len(parts):
+                    iface = parts[idx + 1]
+                    if iface != IDENTITY_INTERFACE:
+                        return iface
+
+    try:
+        fallback = subprocess.run(
+            ["ip", "-4", "route", "get", "1.1.1.1"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    if fallback.returncode != 0:
+        return None
+
+    parts = fallback.stdout.strip().split()
+    if "dev" in parts:
+        idx = parts.index("dev")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return None
+
+
+def detect_block_interface(gateway_ip=None):
+    if gateway_ip:
+        iface = get_interface_for_ipv4(gateway_ip)
+        if iface:
+            return iface
+    return get_default_wan_interface() or DEFAULT_WAN_INTERFACE
+
+
+def ensure_iptables_rule(check_args, add_args, dashboard_state=None):
+    check_result = run_iptables(check_args, dashboard_state=dashboard_state, report_error=False)
+    if check_result.returncode == 0:
+        return True
+    add_result = run_iptables(add_args, dashboard_state=dashboard_state)
+    return add_result.returncode == 0
+
+
+def block_ip(attacker_ip, victim_ip, dashboard_state=None):
+    # Keep drops inside BRADSAFE_FILTER, not directly in FORWARD.
+    check_args = [FILTER_BLOCK_CHAIN, "-s", attacker_ip, "-j", "DROP"]
+    if run_iptables(["-C"] + check_args, dashboard_state=dashboard_state, report_error=False).returncode == 0:
+        return True
+
+    add_result = run_iptables(["-A"] + check_args, dashboard_state=dashboard_state)
+    if add_result.returncode != 0 and dashboard_state:
+        stderr = (add_result.stderr or "").strip() or "unknown iptables error"
+        dashboard_state.add_event(
+            "WARN",
+            f"Failed to block attacker {attacker_ip} targeting {victim_ip}: {stderr}",
+            peer_ip=victim_ip,
+            attacker_ip=attacker_ip,
+        )
+        return False
+    return add_result.returncode == 0
 
 
 def is_in_network(ip_value, networks):
@@ -484,16 +618,10 @@ def clear_runtime_blocks():
 
 
 def clear_runtime_chain(table, chain):
-    base_cmd = ["sudo", "iptables"]
+    list_args = ["-S", chain]
     if table:
-        base_cmd.extend(["-t", table])
-
-    list_result = subprocess.run(
-        base_cmd + ["-S", chain],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+        list_args = ["-t", table] + list_args
+    list_result = run_iptables(list_args, report_error=False)
     if list_result.returncode != 0:
         return
 
@@ -503,27 +631,34 @@ def clear_runtime_chain(table, chain):
             continue
         delete_tokens = shlex.split(rule_line)
         delete_tokens[0] = "-D"
-        run_quiet(base_cmd + delete_tokens)
+        delete_args = delete_tokens
+        if table:
+            delete_args = ["-t", table] + delete_args
+        run_iptables(delete_args, report_error=False)
 
 
-def ensure_block_chains():
-    run_quiet(["sudo", "iptables", "-t", "raw", "-N", RAW_BLOCK_CHAIN])
-    run_quiet(["sudo", "iptables", "-N", FILTER_BLOCK_CHAIN])
-    if subprocess.run(
-        ["sudo", "iptables", "-t", "raw", "-C", "PREROUTING", "-j", RAW_BLOCK_CHAIN],
-        stderr=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        check=False,
-    ).returncode != 0:
-        run_quiet(["sudo", "iptables", "-t", "raw", "-I", "PREROUTING", "-j", RAW_BLOCK_CHAIN])
+def ensure_block_chains(dashboard_state=None):
+    if run_iptables(["-t", "raw", "-S", RAW_BLOCK_CHAIN], report_error=False).returncode != 0:
+        run_iptables(["-t", "raw", "-N", RAW_BLOCK_CHAIN], dashboard_state=dashboard_state)
+    if run_iptables(["-S", FILTER_BLOCK_CHAIN], report_error=False).returncode != 0:
+        run_iptables(["-N", FILTER_BLOCK_CHAIN], dashboard_state=dashboard_state)
 
-    if subprocess.run(
-        ["sudo", "iptables", "-C", "FORWARD", "-j", FILTER_BLOCK_CHAIN],
-        stderr=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        check=False,
-    ).returncode != 0:
-        run_quiet(["sudo", "iptables", "-I", "FORWARD", "-j", FILTER_BLOCK_CHAIN])
+    prerouting_selector = ["PREROUTING"]
+    forward_selector = ["FORWARD"]
+    if BLOCK_INTERFACE:
+        prerouting_selector.extend(["-i", BLOCK_INTERFACE])
+        forward_selector.extend(["-i", BLOCK_INTERFACE])
+
+    ensure_iptables_rule(
+        ["-t", "raw", "-C"] + prerouting_selector + ["-j", RAW_BLOCK_CHAIN],
+        ["-t", "raw", "-I"] + prerouting_selector + ["-j", RAW_BLOCK_CHAIN],
+        dashboard_state=dashboard_state,
+    )
+    ensure_iptables_rule(
+        ["-C"] + forward_selector + ["-j", FILTER_BLOCK_CHAIN],
+        ["-I"] + forward_selector + ["-j", FILTER_BLOCK_CHAIN],
+        dashboard_state=dashboard_state,
+    )
 
 
 def get_interface_ipv4(iface):
@@ -569,8 +704,9 @@ def discover_gateway_identity():
 
 
 def extreme_lockdown():
-    run_quiet(["sudo", "ethtool", "-K", INTERFACE, "gro", "off"])
-    run_quiet(["sudo", "ethtool", "-K", INTERFACE, "lro", "off"])
+    if BLOCK_INTERFACE:
+        run_quiet(["sudo", "ethtool", "-K", BLOCK_INTERFACE, "gro", "off"])
+        run_quiet(["sudo", "ethtool", "-K", BLOCK_INTERFACE, "lro", "off"])
     ensure_block_chains()
     clear_runtime_blocks()
     return firewall_manager.initialize_firewall()
@@ -597,10 +733,11 @@ def protect_peer(attacker_ip, victim_ip, analysis, snapshot, dashboard_state):
             )
         return
 
-    run_quiet(
-        ["sudo", "iptables", "-t", "raw", "-A", RAW_BLOCK_CHAIN, "-s", attacker_ip, "-d", victim_ip, "-j", "DROP"]
-    )
-    run_quiet(["sudo", "iptables", "-A", FILTER_BLOCK_CHAIN, "-s", attacker_ip, "-d", victim_ip, "-j", "DROP"])
+    raw_check_args = ["-t", "raw", RAW_BLOCK_CHAIN, "-s", attacker_ip, "-d", victim_ip, "-j", "DROP"]
+    if run_iptables(["-C"] + raw_check_args, report_error=False).returncode != 0:
+        run_iptables(["-A"] + raw_check_args, dashboard_state=dashboard_state)
+    if not block_ip(attacker_ip, victim_ip, dashboard_state=dashboard_state):
+        return
 
     victim_peer_key, used_fallback = resolve_victim_peer_public_key(victim_ip)
     if used_fallback:
@@ -657,7 +794,7 @@ def monitor_logic(dashboard_state):
     ai_analyzer = AIAnalyzer()
     last_heartbeat = time.time()
     last_peer_registry_refresh = 0.0
-    attacker_strikes = {}
+    flow_strikes = {}
     dashboard_state.set_ai_status("Active" if ai_analyzer.model is not None else "Load Error")
     if ai_analyzer.load_error:
         dashboard_state.add_event("WARN", ai_analyzer.load_error)
@@ -688,7 +825,7 @@ def monitor_logic(dashboard_state):
             )
 
             send_heartbeat = curr_time - last_heartbeat >= HEARTBEAT_SECONDS
-            seen_attackers = set()
+            seen_flows = set()
 
             for peer_ip in dashboard_state.registered_peers:
                 snapshot = snapshot_by_peer.get(peer_ip)
@@ -704,19 +841,23 @@ def monitor_logic(dashboard_state):
                 attack_candidate = should_treat_as_attack(analysis, snapshot) and bool(attacker_ip)
                 strike_count = 0
                 if attacker_ip:
-                    seen_attackers.add(attacker_ip)
-                    if attack_candidate:
+                    flow_key = (attacker_ip, snapshot.victim_ip)
+                    seen_flows.add(flow_key)
+                    safe_duration = max(snapshot.duration_seconds, 0.001)
+                    attacker_pps = snapshot.attacker_packet_count / safe_duration
+                    threshold_breach = attacker_pps >= PPS_THRESHOLD
+                    if attack_candidate and threshold_breach:
                         strike_count = min(
                             STRIKE_TRIGGER_COUNT,
-                            attacker_strikes.get(attacker_ip, 0) + 1,
+                            flow_strikes.get(flow_key, 0) + 1,
                         )
                     else:
-                        strike_count = max(0, attacker_strikes.get(attacker_ip, 0) - 1)
+                        strike_count = 0
 
                     if strike_count > 0:
-                        attacker_strikes[attacker_ip] = strike_count
+                        flow_strikes[flow_key] = strike_count
                     else:
-                        attacker_strikes.pop(attacker_ip, None)
+                        flow_strikes.pop(flow_key, None)
 
                 is_attack = attack_candidate and strike_count >= STRIKE_TRIGGER_COUNT
                 status = "Under Attack" if is_attack else "Healthy"
@@ -750,14 +891,10 @@ def monitor_logic(dashboard_state):
                     if not backend_result["ok"]:
                         dashboard_state.add_event("WARN", backend_result["message"], peer_ip=snapshot.victim_ip)
 
-            for attacker_ip in list(attacker_strikes.keys()):
-                if attacker_ip in seen_attackers:
+            for flow_key in list(flow_strikes.keys()):
+                if flow_key in seen_flows:
                     continue
-                decayed = max(0, attacker_strikes.get(attacker_ip, 0) - 1)
-                if decayed == 0:
-                    attacker_strikes.pop(attacker_ip, None)
-                else:
-                    attacker_strikes[attacker_ip] = decayed
+                flow_strikes.pop(flow_key, None)
 
             if send_heartbeat:
                 last_heartbeat = curr_time
@@ -773,8 +910,10 @@ if __name__ == "__main__":
 
     try:
         discovered_identity = discover_gateway_identity()
+        BLOCK_INTERFACE = detect_block_interface(discovered_identity)
         dashboard_state.set_gateway_identity(f"{discovered_identity} on {IDENTITY_INTERFACE}")
         dashboard_state.add_event("WARN", f"Gateway identity discovered on {IDENTITY_INTERFACE}: {discovered_identity}")
+        dashboard_state.add_event("WARN", f"Firewall interface selected: {BLOCK_INTERFACE}")
         firewall_info = extreme_lockdown()
         dashboard_state.set_backend_status("Connected")
         dashboard_state.add_event("WARN", "Demo mode startup: cleared all runtime firewall blocks from previous runs.")
