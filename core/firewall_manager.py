@@ -72,15 +72,16 @@ def build_identity_payload(victim_vpn_ip=None):
     if effective_victim_vpn_ip:
         payload["victim_vpn_ip"] = effective_victim_vpn_ip
 
-    # Static profile identifiers from .env should only accompany the profile they belong to.
+    # Key-first identity: always include WireGuard public key when configured so
+    # backend resolution can survive VPN IP drift.
+    if WIREGUARD_PUBLIC_KEY:
+        payload["wireguard_public_key"] = WIREGUARD_PUBLIC_KEY
+    # Keep peer ref scoped to configured profile to avoid profile collisions.
     identity_matches_configured_profile = (
         not effective_victim_vpn_ip
         or not PROTECTED_VPN_IP
         or effective_victim_vpn_ip == PROTECTED_VPN_IP
     )
-
-    if identity_matches_configured_profile and WIREGUARD_PUBLIC_KEY:
-        payload["wireguard_public_key"] = WIREGUARD_PUBLIC_KEY
     if identity_matches_configured_profile and GATEWAY_PEER_REF:
         payload["gateway_peer_ref"] = GATEWAY_PEER_REF
 
@@ -117,6 +118,8 @@ def build_alert_payload(
         payload["attack_probability"] = float(attack_probability)
     if peer_metrics:
         payload["peer_metrics"] = peer_metrics
+        if "pps" in peer_metrics:
+            payload["pps"] = float(peer_metrics["pps"])
 
     return payload
 
@@ -147,11 +150,24 @@ def send_status_to_backend(
             peer_metrics=peer_metrics,
         )
         if is_attack:
+            ip_drift_detected = (
+                bool(PROTECTED_VPN_IP)
+                and bool(payload.get("victim_vpn_ip"))
+                and payload["victim_vpn_ip"] != PROTECTED_VPN_IP
+            )
             log_msg = (
                 f"[ALERT] BRADSafe mitigation sent for {attacker_ip} targeting "
                 f"{payload.get('victim_vpn_ip', 'configured profile')} "
                 f"({payload.get('attack_type', 'Unknown')}, score={payload.get('attack_probability', 'n/a')})"
             )
+            if ip_drift_detected and payload.get("wireguard_public_key"):
+                drift_msg = (
+                    f"[KEY-FIRST] VPN IP drift detected ({PROTECTED_VPN_IP} -> "
+                    f"{payload.get('victim_vpn_ip')}). Sending alert with "
+                    "wireguard_public_key priority."
+                )
+                print(drift_msg)
+                log_msg = f"{log_msg} {drift_msg}"
         else:
             log_msg = (
                 f"[HEARTBEAT] BRADSafe system status: Healthy for "

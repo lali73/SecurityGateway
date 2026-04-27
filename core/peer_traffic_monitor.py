@@ -7,6 +7,9 @@ import numpy as np
 from scapy.all import AsyncSniffer, IP, TCP, UDP
 
 
+BYPASS_PORTS = {53, 67, 68}
+
+
 @dataclass
 class PeerTrafficSnapshot:
     victim_ip: str
@@ -75,6 +78,16 @@ class PeerTrafficMonitor:
     def handle_packet(self, packet):
         if not packet.haslayer(IP):
             return
+
+        # Bypass DNS/DHCP traffic early to avoid false positives from control-plane bursts.
+        if packet.haslayer(TCP):
+            tcp_layer = packet[TCP]
+            if int(tcp_layer.sport) in BYPASS_PORTS or int(tcp_layer.dport) in BYPASS_PORTS:
+                return
+        if packet.haslayer(UDP):
+            udp_layer = packet[UDP]
+            if int(udp_layer.sport) in BYPASS_PORTS or int(udp_layer.dport) in BYPASS_PORTS:
+                return
 
         src_ip = packet[IP].src
         dst_ip = packet[IP].dst

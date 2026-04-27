@@ -1,6 +1,8 @@
 import sys
 import time
 import subprocess
+import ipaddress
+import shlex
 from collections import deque
 from datetime import datetime
 from threading import Event, Lock, Thread
@@ -40,9 +42,14 @@ MANUAL_UDP_ATTACKER_PPS_THRESHOLD = 700
 MANUAL_UDP_RATIO_THRESHOLD = 0.85
 MANUAL_SYN_RATIO_THRESHOLD = 0.45
 MANUAL_EXTREME_PPS = 5000
+STRIKE_TRIGGER_COUNT = 3
 RAW_BLOCK_CHAIN = "BRADSAFE_RAW"
 FILTER_BLOCK_CHAIN = "BRADSAFE_FILTER"
 blocked_flows = set()
+NEVER_BLOCK_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/24"),
+    ipaddress.ip_network("127.0.0.0/8"),
+)
 
 
 def now_label():
@@ -343,6 +350,18 @@ def run_quiet(command, check=False):
     )
 
 
+def is_in_network(ip_value, networks):
+    try:
+        ip_obj = ipaddress.ip_address(ip_value)
+    except ValueError:
+        return False
+    return any(ip_obj in network for network in networks)
+
+
+def is_never_block_ip(ip_value):
+    return bool(ip_value) and is_in_network(ip_value, NEVER_BLOCK_NETWORKS)
+
+
 def discover_registered_peers():
     try:
         result = subprocess.run(
@@ -394,9 +413,32 @@ def discover_registered_peers():
 
 
 def clear_runtime_blocks():
-    run_quiet(["sudo", "iptables", "-t", "raw", "-F", RAW_BLOCK_CHAIN])
-    run_quiet(["sudo", "iptables", "-F", FILTER_BLOCK_CHAIN])
+    clear_runtime_chain("raw", RAW_BLOCK_CHAIN)
+    clear_runtime_chain(None, FILTER_BLOCK_CHAIN)
     blocked_flows.clear()
+
+
+def clear_runtime_chain(table, chain):
+    base_cmd = ["sudo", "iptables"]
+    if table:
+        base_cmd.extend(["-t", table])
+
+    list_result = subprocess.run(
+        base_cmd + ["-S", chain],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if list_result.returncode != 0:
+        return
+
+    for rule_line in list_result.stdout.splitlines():
+        rule_line = rule_line.strip()
+        if not rule_line.startswith(f"-A {chain} "):
+            continue
+        delete_tokens = shlex.split(rule_line)
+        delete_tokens[0] = "-D"
+        run_quiet(base_cmd + delete_tokens)
 
 
 def ensure_block_chains():
@@ -470,7 +512,24 @@ def extreme_lockdown():
 
 def protect_peer(attacker_ip, victim_ip, analysis, snapshot, dashboard_state):
     flow_key = (attacker_ip, victim_ip)
-    if not attacker_ip or not victim_ip or attacker_ip in WHITELIST or flow_key in blocked_flows:
+    if (
+        not attacker_ip
+        or not victim_ip
+        or attacker_ip in WHITELIST
+        or flow_key in blocked_flows
+        or is_never_block_ip(attacker_ip)
+        or is_never_block_ip(victim_ip)
+    ):
+        if attacker_ip and (is_never_block_ip(attacker_ip) or is_never_block_ip(victim_ip)):
+            dashboard_state.add_event(
+                "WARN",
+                (
+                    f"Policy bypass: no block for attacker {attacker_ip} against {victim_ip} "
+                    f"(protected local range)."
+                ),
+                peer_ip=victim_ip,
+                attacker_ip=attacker_ip,
+            )
         return
 
     run_quiet(
@@ -519,6 +578,7 @@ def monitor_logic(dashboard_state):
     ai_analyzer = AIAnalyzer()
     last_heartbeat = time.time()
     last_peer_registry_refresh = 0.0
+    attacker_strikes = {}
     dashboard_state.set_ai_status("Active" if ai_analyzer.model is not None else "Load Error")
     if ai_analyzer.load_error:
         dashboard_state.add_event("WARN", ai_analyzer.load_error)
@@ -549,6 +609,7 @@ def monitor_logic(dashboard_state):
             )
 
             send_heartbeat = curr_time - last_heartbeat >= HEARTBEAT_SECONDS
+            seen_attackers = set()
 
             for peer_ip in dashboard_state.registered_peers:
                 snapshot = snapshot_by_peer.get(peer_ip)
@@ -560,7 +621,25 @@ def monitor_logic(dashboard_state):
                 analysis = attack_analysis_for_demo(ai_analyzer.analyze(feature_vector), snapshot)
                 score = analysis["attack_probability"]
                 kbps = (snapshot.bps * 8) / 1000
-                is_attack = should_treat_as_attack(analysis, snapshot) and bool(snapshot.top_attacker_ip)
+                attacker_ip = snapshot.top_attacker_ip
+                attack_candidate = should_treat_as_attack(analysis, snapshot) and bool(attacker_ip)
+                strike_count = 0
+                if attacker_ip:
+                    seen_attackers.add(attacker_ip)
+                    if attack_candidate:
+                        strike_count = min(
+                            STRIKE_TRIGGER_COUNT,
+                            attacker_strikes.get(attacker_ip, 0) + 1,
+                        )
+                    else:
+                        strike_count = max(0, attacker_strikes.get(attacker_ip, 0) - 1)
+
+                    if strike_count > 0:
+                        attacker_strikes[attacker_ip] = strike_count
+                    else:
+                        attacker_strikes.pop(attacker_ip, None)
+
+                is_attack = attack_candidate and strike_count >= STRIKE_TRIGGER_COUNT
                 status = "Under Attack" if is_attack else "Healthy"
                 dashboard_state.mark_peer(
                     peer_ip,
@@ -568,11 +647,11 @@ def monitor_logic(dashboard_state):
                     snapshot.pps,
                     kbps,
                     score,
-                    attacker_ip=snapshot.top_attacker_ip or "-",
+                    attacker_ip=attacker_ip or "-",
                 )
 
                 if is_attack:
-                    protect_peer(snapshot.top_attacker_ip, snapshot.victim_ip, analysis, snapshot, dashboard_state)
+                    protect_peer(attacker_ip, snapshot.victim_ip, analysis, snapshot, dashboard_state)
 
                 if send_heartbeat:
                     backend_result = firewall_manager.send_status_to_backend(
@@ -585,6 +664,15 @@ def monitor_logic(dashboard_state):
                     dashboard_state.set_backend_status("Connected" if backend_result["ok"] else "Degraded")
                     if not backend_result["ok"]:
                         dashboard_state.add_event("WARN", backend_result["message"], peer_ip=snapshot.victim_ip)
+
+            for attacker_ip in list(attacker_strikes.keys()):
+                if attacker_ip in seen_attackers:
+                    continue
+                decayed = max(0, attacker_strikes.get(attacker_ip, 0) - 1)
+                if decayed == 0:
+                    attacker_strikes.pop(attacker_ip, None)
+                else:
+                    attacker_strikes[attacker_ip] = decayed
 
             if send_heartbeat:
                 last_heartbeat = curr_time
