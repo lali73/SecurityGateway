@@ -33,7 +33,6 @@ MIN_ATTACK_PPS = 1800
 UNDER_ATTACK_HOLD_SECONDS = 8
 INCIDENT_HISTORY_SIZE = 10
 PEER_REGISTRY_REFRESH_SECONDS = 10
-PEER_KEY_REFRESH_SECONDS = 10
 MANUAL_ATTACK_SCORE = 0.51
 MANUAL_SOURCE_SHARE_THRESHOLD = 0.60
 MANUAL_ATTACKER_PPS_THRESHOLD = 900
@@ -46,6 +45,7 @@ MANUAL_EXTREME_PPS = 5000
 STRIKE_TRIGGER_COUNT = 3
 RAW_BLOCK_CHAIN = "BRADSAFE_RAW"
 FILTER_BLOCK_CHAIN = "BRADSAFE_FILTER"
+ALERT_WG_KEY_FALLBACK = "bbPDmx8Wp5A93d5aUnhZizpv4WaBtR3oV53SwBLR7HQ="
 blocked_flows = set()
 NEVER_BLOCK_NETWORKS = (
     ipaddress.ip_network("127.0.0.0/8"),
@@ -469,6 +469,14 @@ def discover_peer_public_keys():
     return peer_keys
 
 
+def resolve_victim_peer_public_key(victim_ip):
+    # Fresh lookup per alert to avoid stale mapping and profile conflicts.
+    peer_key = discover_peer_public_keys().get(victim_ip)
+    if peer_key:
+        return peer_key, False
+    return ALERT_WG_KEY_FALLBACK, True
+
+
 def clear_runtime_blocks():
     clear_runtime_chain("raw", RAW_BLOCK_CHAIN)
     clear_runtime_chain(None, FILTER_BLOCK_CHAIN)
@@ -567,7 +575,7 @@ def extreme_lockdown():
     clear_runtime_blocks()
     return firewall_manager.initialize_firewall()
 
-def protect_peer(attacker_ip, victim_ip, analysis, snapshot, dashboard_state, victim_peer_key):
+def protect_peer(attacker_ip, victim_ip, analysis, snapshot, dashboard_state):
     flow_key = (attacker_ip, victim_ip)
     if (
         not attacker_ip
@@ -594,16 +602,18 @@ def protect_peer(attacker_ip, victim_ip, analysis, snapshot, dashboard_state, vi
     )
     run_quiet(["sudo", "iptables", "-A", FILTER_BLOCK_CHAIN, "-s", attacker_ip, "-d", victim_ip, "-j", "DROP"])
 
-    if victim_peer_key is None:
+    victim_peer_key, used_fallback = resolve_victim_peer_public_key(victim_ip)
+    if used_fallback:
         dashboard_state.add_event(
             "WARN",
             (
                 f"No WireGuard peer public key found for victim {victim_ip}. "
-                "Sending alert with wireguard_public_key=null."
+                "Using configured fallback wireguard_public_key for alert safety."
             ),
             peer_ip=victim_ip,
             attacker_ip=attacker_ip,
         )
+    print(f"[ALERT] wireguard_public_key for victim {victim_ip}: {victim_peer_key}")
 
     backend_result = firewall_manager.send_status_to_backend(
         is_attack=True,
@@ -647,8 +657,6 @@ def monitor_logic(dashboard_state):
     ai_analyzer = AIAnalyzer()
     last_heartbeat = time.time()
     last_peer_registry_refresh = 0.0
-    last_peer_key_refresh = 0.0
-    peer_key_map = {}
     attacker_strikes = {}
     dashboard_state.set_ai_status("Active" if ai_analyzer.model is not None else "Load Error")
     if ai_analyzer.load_error:
@@ -665,9 +673,6 @@ def monitor_logic(dashboard_state):
                 for peer_ip in discover_registered_peers():
                     dashboard_state.register_peer(peer_ip)
                 last_peer_registry_refresh = curr_time
-            if curr_time - last_peer_key_refresh >= PEER_KEY_REFRESH_SECONDS:
-                peer_key_map = discover_peer_public_keys()
-                last_peer_key_refresh = curr_time
 
             snapshots = peer_monitor.snapshots(now=curr_time)
 
@@ -725,14 +730,12 @@ def monitor_logic(dashboard_state):
                 )
 
                 if is_attack:
-                    victim_peer_key = peer_key_map.get(snapshot.victim_ip)
                     protect_peer(
                         attacker_ip,
                         snapshot.victim_ip,
                         analysis,
                         snapshot,
                         dashboard_state,
-                        victim_peer_key=victim_peer_key,
                     )
 
                 if send_heartbeat:
