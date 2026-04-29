@@ -550,7 +550,10 @@ def discover_registered_peers():
     return sorted(peers, key=lambda ip: tuple(int(part) for part in ip.split(".")))
 
 
-def discover_peer_public_keys():
+def get_public_key_by_ip(target_ip):
+    if not target_ip:
+        return None
+
     try:
         result = subprocess.run(
             ["wg", "show", "wg0", "dump"],
@@ -562,12 +565,11 @@ def discover_peer_public_keys():
         return {}
 
     if result.returncode != 0:
-        return {}
+        return None
 
-    peer_keys = {}
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if len(lines) <= 1:
-        return peer_keys
+        return None
 
     for line in lines[1:]:
         parts = line.split("\t")
@@ -597,18 +599,48 @@ def discover_peer_public_keys():
             except ValueError:
                 continue
 
-            if ip_obj.version == 4:
-                peer_keys[ip_value] = peer_public_key
+            if ip_obj.version == 4 and ip_value == target_ip:
+                return peer_public_key
 
-    return peer_keys
+    return None
 
 
 def resolve_victim_peer_public_key(victim_ip):
     # Fresh lookup per alert to avoid stale mapping and profile conflicts.
-    peer_key = discover_peer_public_keys().get(victim_ip)
+    peer_key = get_public_key_by_ip(victim_ip)
     if peer_key:
         return peer_key, False
     return ALERT_WG_KEY_FALLBACK, True
+
+
+def quarantine_attacker_peer(attacker_ip, dashboard_state=None):
+    attacker_key = get_public_key_by_ip(attacker_ip)
+    if not attacker_key:
+        if dashboard_state:
+            dashboard_state.add_event(
+                "WARN",
+                f"No WireGuard peer key found for attacker {attacker_ip}; wg quarantine skipped.",
+                attacker_ip=attacker_ip,
+            )
+        return False
+
+    result = subprocess.run(
+        ["sudo", "wg", "set", "wg0", "peer", attacker_key, "allowed-ips", "127.0.0.1/32"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip() or "unknown wg error"
+        if dashboard_state:
+            dashboard_state.add_event(
+                "WARN",
+                f"Failed wg quarantine for attacker {attacker_ip}: {stderr}",
+                attacker_ip=attacker_ip,
+            )
+        return False
+
+    return True
 
 
 def clear_runtime_blocks():
@@ -657,6 +689,11 @@ def ensure_block_chains(dashboard_state=None):
     ensure_iptables_rule(
         ["-C"] + forward_selector + ["-j", FILTER_BLOCK_CHAIN],
         ["-I"] + forward_selector + ["-j", FILTER_BLOCK_CHAIN],
+        dashboard_state=dashboard_state,
+    )
+    ensure_iptables_rule(
+        ["-C", "FORWARD", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+        ["-I", "FORWARD", "1", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
         dashboard_state=dashboard_state,
     )
 
@@ -736,6 +773,13 @@ def protect_peer(attacker_ip, victim_ip, analysis, snapshot, dashboard_state):
     raw_check_args = ["-t", "raw", RAW_BLOCK_CHAIN, "-s", attacker_ip, "-d", victim_ip, "-j", "DROP"]
     if run_iptables(["-C"] + raw_check_args, report_error=False).returncode != 0:
         run_iptables(["-A"] + raw_check_args, dashboard_state=dashboard_state)
+
+    generic_raw_check_args = ["-t", "raw", RAW_BLOCK_CHAIN, "-s", attacker_ip, "-j", "DROP"]
+    if run_iptables(["-C"] + generic_raw_check_args, report_error=False).returncode != 0:
+        run_iptables(["-I"] + generic_raw_check_args, dashboard_state=dashboard_state)
+
+    quarantine_attacker_peer(attacker_ip, dashboard_state=dashboard_state)
+
     if not block_ip(attacker_ip, victim_ip, dashboard_state=dashboard_state):
         return
 

@@ -1,4 +1,6 @@
 import os
+import subprocess
+import ipaddress
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -42,6 +44,8 @@ PROTECTED_VPN_IP = env_value("PROTECTED_VPN_IP")
 WIREGUARD_PUBLIC_KEY = env_value("WIREGUARD_PUBLIC_KEY")
 GATEWAY_PEER_REF = env_value("GATEWAY_PEER_REF")
 GATEWAY_ID = env_value("GATEWAY_ID", "gateway-dev-1")
+RAW_BLOCK_CHAIN = "BRADSAFE_RAW"
+FILTER_BLOCK_CHAIN = "BRADSAFE_FILTER"
 
 
 def format_backend_error(response):
@@ -210,6 +214,53 @@ def send_status_to_backend(
 
 
 def initialize_firewall():
+    # Demo reset: clear only runtime BRADSAFE chains and restore peer allowed-ips.
+    subprocess.run(["sudo", "/usr/sbin/iptables", "-t", "raw", "-F", RAW_BLOCK_CHAIN], check=False)
+    subprocess.run(["sudo", "/usr/sbin/iptables", "-F", FILTER_BLOCK_CHAIN], check=False)
+
+    wg_dump = subprocess.run(
+        ["wg", "show", "wg0", "dump"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if wg_dump.returncode == 0:
+        lines = [line.strip() for line in wg_dump.stdout.splitlines() if line.strip()]
+        for line in lines[1:]:
+            parts = line.split("\t")
+            if len(parts) < 4:
+                parts = line.split()
+            if len(parts) < 4:
+                continue
+
+            peer_public_key = parts[0].strip()
+            allowed_ips = parts[3].strip()
+            if not peer_public_key or not allowed_ips:
+                continue
+
+            reset_ip = None
+            for candidate in allowed_ips.split(","):
+                candidate = candidate.strip()
+                if "/" in candidate:
+                    ip_value, prefix = candidate.split("/", 1)
+                    if prefix != "32":
+                        continue
+                else:
+                    ip_value = candidate
+                try:
+                    ip_obj = ipaddress.ip_address(ip_value)
+                except ValueError:
+                    continue
+                if ip_obj.version == 4 and str(ip_obj).startswith("10.0.0."):
+                    reset_ip = str(ip_obj)
+                    break
+
+            if reset_ip:
+                subprocess.run(
+                    ["sudo", "wg", "set", "wg0", "peer", peer_public_key, "allowed-ips", f"{reset_ip}/32"],
+                    check=False,
+                )
+
     identifiers = []
     effective_vpn_ip = PROTECTED_VPN_IP or get_current_vpn_ip()
     if effective_vpn_ip:
